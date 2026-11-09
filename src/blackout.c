@@ -40,12 +40,15 @@ static WCHAR iniPath[MAX_PATH], openrgb[MAX_PATH], rgbOff[1024], rgbOn[1024];
 static BYTE color[3] = {255, 0, 0};
 static int linkLeds;
 static WCHAR ddcIds[256];
+static int ddcOff = 4, savedPaths;
 static HANDLE link = INVALID_HANDLE_VALUE;
 static struct { HWND hwnd; WINDOWPLACEMENT wp; } saved[MAX_WINDOWS];
 static int savedCount;
 static DWORD idleRestore = (DWORD)-1;
 static const int fanSteps[] = {25, 30, 35, 40, 45, 50, 55, 60, 70, 100};
 static HPOWERNOTIFY displayNotify;
+
+static void ddcPower(BOOL on);
 
 static DWORD getDword(LPCWSTR name, DWORD fallback) {
     DWORD v, n = sizeof(v);
@@ -119,6 +122,7 @@ static void loadConfig(void) {
     color[0] = (BYTE)(c >> 16), color[1] = (BYTE)(c >> 8), color[2] = (BYTE)c;
     GetPrivateProfileStringW(L"ddc", L"monitors", L"", ddcIds, 256, iniPath);
     CharUpperW(ddcIds);
+    ddcOff = GetPrivateProfileIntW(L"ddc", L"off", 4, iniPath);
     linkLeds = GetPrivateProfileIntW(L"link", L"leds", 0, iniPath);
     if (linkLeds > MAX_LINK_LEDS) linkLeds = MAX_LINK_LEDS;
 }
@@ -257,6 +261,8 @@ static void setIdleTimeout(DWORD seconds) {
 static void screensOff(HWND hwnd) {
     GUID *scheme;
     DWORD current;
+    // DDC monitors go to standby first, while their link is still up; once the GPU output sleeps, DDC can't reach them.
+    ddcPower(FALSE);
     if (idleRestore == (DWORD)-1 && PowerGetActiveScheme(NULL, &scheme) == ERROR_SUCCESS) {
         if (PowerReadACValueIndex(NULL, scheme, &GUID_VIDEO_SUBGROUP, &GUID_VIDEO_POWERDOWN_TIMEOUT, &current) == ERROR_SUCCESS) {
             idleRestore = current;
@@ -273,8 +279,9 @@ static void restoreIdle(void) {
     idleRestore = (DWORD)-1;
 }
 
-// DDC/CI power control (VCP 0xD6: 1 = on, 5 = off) for monitors listed in [ddc] monitors=, matched against the
-// monitor's hardware ID (e.g. BNQ7F2F). For screens whose GPU output keeps waking them to show "No Signal".
+// DDC/CI power control (VCP 0xD6: 1 = on, 4 = standby, 5 = off) for monitors listed in [ddc] monitors=, matched
+// against the monitor's hardware ID (e.g. BNQ7F2F). For screens whose GPU output keeps waking them to show "No Signal".
+// Hard off (5) makes some monitors drop off the bus and ignore the wake command, so [ddc] off= defaults to standby (4).
 static BOOL CALLBACK ddcMonitor(HMONITOR m, HDC dc, LPRECT r, LPARAM power) {
     MONITORINFOEXW mi = {0};
     DISPLAY_DEVICEW dd = {0};
@@ -298,7 +305,18 @@ static BOOL CALLBACK ddcMonitor(HMONITOR m, HDC dc, LPRECT r, LPARAM power) {
 }
 
 static void ddcPower(BOOL on) {
-    if (ddcIds[0]) EnumDisplayMonitors(NULL, NULL, ddcMonitor, on ? 1 : 5);
+    if (ddcIds[0]) EnumDisplayMonitors(NULL, NULL, ddcMonitor, on ? 1 : ddcOff);
+}
+
+static int activePaths(void) {
+    UINT32 np = 0, nm = 0;
+    return GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) == ERROR_SUCCESS ? (int)np : 0;
+}
+
+// If a monitor dropped out of the desktop while asleep, re-extend. Windows restores the saved arrangement for that
+// monitor set from its own display database.
+static void restoreTopology(void) {
+    if (savedPaths && activePaths() < savedPaths) SetDisplayConfig(0, NULL, 0, NULL, SDC_TOPOLOGY_EXTEND | SDC_APPLY);
 }
 
 static void applyFans(void) {
@@ -380,6 +398,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wp == TIMER_LAYOUT) {
+            restoreTopology();
             restoreWindows();
         } else if (wp == TIMER_OFF) {
             screensOff(hwnd);
@@ -421,6 +440,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     }
                     if (state == 0 && screensOn) {
                         savedCount = 0;
+                        savedPaths = activePaths();
                         EnumWindows(saveWindow, 0);
                         ddcPower(FALSE);
                     } else if (state == 1 && !screensOn) {
