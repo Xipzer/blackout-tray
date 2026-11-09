@@ -44,6 +44,7 @@ For RGB, also unzip [OpenRGB](https://openrgb.org/releases.html) portable to the
 |---|---|---|
 | `[rgb]` | `openrgb` | Path to `OpenRGB.exe`. Empty skips OpenRGB. |
 | | `off`, `on` | OpenRGB arguments for each state |
+| | `off2`..`off4`, `on2`..`on4` | Extra steps. Use for devices that are sometimes missing (wireless, speakers). |
 | | `color` | Hex colour for the iCUE LINK hub and RAM when on |
 | `[link]` | `leds` | LED count on the iCUE LINK chain. 0 disables it. |
 | `[ddc]` | `monitors` | Monitor hardware IDs to power off, comma separated (e.g. `BNQ7F2F`) |

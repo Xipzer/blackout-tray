@@ -36,7 +36,7 @@ static BOOL busy;
 static int pending = -1;
 static BOOL hasRgb, hasOpenRgb, hasRam, hasFans;
 static BOOL screensOn = TRUE;
-static WCHAR iniPath[MAX_PATH], openrgb[MAX_PATH], rgbOff[1024], rgbOn[1024];
+static WCHAR iniPath[MAX_PATH], openrgb[MAX_PATH], rgbOff[4][1024], rgbOn[4][1024];
 static BYTE color[3] = {255, 0, 0};
 static int linkLeds;
 static WCHAR ddcIds[256];
@@ -96,9 +96,19 @@ static void exeDir(LPWSTR out, LPCWSTR file) {
 
 static void applyRgb(BOOL on) {
     WCHAR cmd[1400], exe[MAX_PATH];
+    // Steps run one after another in a single cmd.exe, so a device that is missing from one step (OpenRGB then fails
+    // that whole call) can't stop the others. Keep devices that come and go in their own step (off2=, on2=, ...).
     if (hasOpenRgb) {
-        wsprintfW(cmd, L"\"%s\" %s", openrgb, on ? rgbOn : rgbOff);
-        spawn(cmd);
+        WCHAR (*steps)[1024] = on ? rgbOn : rgbOff, chain[4 * 1400];
+        lstrcpyW(chain, L"cmd.exe /d /c \"");
+        for (int i = 0, first = 1; i < 4; i++) {
+            if (!steps[i][0]) continue;
+            wsprintfW(cmd, L"%s\"%s\" %s", first ? L"" : L" & ", openrgb, steps[i]);
+            lstrcatW(chain, cmd);
+            first = 0;
+        }
+        lstrcatW(chain, L"\"");
+        spawn(chain);
     }
     // Optional FURY module: furyled.exe beside blackout.exe drives Kingston FURY DDR5 through Kingston's own service.
     if (hasRam) {
@@ -114,8 +124,12 @@ static void loadConfig(void) {
     exeDir(iniPath, CONFIG);
     GetPrivateProfileStringW(L"rgb", L"openrgb", L"", raw, MAX_PATH, iniPath);
     ExpandEnvironmentStringsW(raw, openrgb, MAX_PATH);
-    GetPrivateProfileStringW(L"rgb", L"off", L"--noautoconnect -m Static -c 000000", rgbOff, 1024, iniPath);
-    GetPrivateProfileStringW(L"rgb", L"on", L"--noautoconnect -m Static -c FF0000", rgbOn, 1024, iniPath);
+    for (int i = 0; i < 4; i++) {
+        WCHAR offKey[8] = L"off", onKey[8] = L"on";
+        if (i) wsprintfW(offKey, L"off%d", i + 1), wsprintfW(onKey, L"on%d", i + 1);
+        GetPrivateProfileStringW(L"rgb", offKey, i ? L"" : L"--noautoconnect -m Static -c 000000", rgbOff[i], 1024, iniPath);
+        GetPrivateProfileStringW(L"rgb", onKey, i ? L"" : L"--noautoconnect -m Static -c FF0000", rgbOn[i], 1024, iniPath);
+    }
     GetPrivateProfileStringW(L"rgb", L"color", L"FF0000", hex, 16, iniPath);
     DWORD c = 0;
     for (WCHAR *h = hex; *h; h++) c = c * 16 + (*h <= L'9' ? *h - L'0' : (*h | 32) - L'a' + 10);
