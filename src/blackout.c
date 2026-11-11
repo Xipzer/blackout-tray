@@ -1,11 +1,13 @@
 // Blackout: tray app for screens off. RGB, fans, DDC monitor power and window layout follow the display state.
-// One hidden window. The only periodic work is the optional 4 s iCUE LINK tick (lighting keep-alive and the coolant fan
-// curve). Helpers (OpenRGB, furyled, schtasks) run once and exit.
+// One hidden window. The only periodic work is the optional 4 s tick (iCUE LINK lighting keep-alive and the fan
+// curve). Helpers (OpenRGB, furyled, schtasks) run once and exit. Fan chips and USB controllers are described by the
+// definition files in the devices folder (devices.c).
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
 #include <setupapi.h>
 #include <hidsdi.h>
+#include <hidpi.h>
 #include <powrprof.h>
 #include <physicalmonitorenumerationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
@@ -18,6 +20,7 @@
 #define ID_SYNC      6
 #define ID_FANCTL    7
 #define ID_CURVE     8
+#define ID_DEVICES   9
 #define ID_FAN_AWAKE 100
 #define ID_FAN_SLEEP 200
 #define TIMER_OFF    1
@@ -28,6 +31,7 @@
 #define MAX_LINK_LEDS 160
 #define MAX_WINDOWS  256
 #define MAX_CURVE    8
+#define MAX_OUT      7
 #define RUN_KEY      L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define TASK_KEY     L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\Blackout"
 #define APP_KEY      L"Software\\Blackout"
@@ -51,11 +55,13 @@ static int savedCount;
 static DWORD idleRestore = (DWORD)-1;
 static const int fanSteps[] = {25, 30, 35, 40, 45, 50, 55, 60, 70, 100};
 static HPOWERNOTIFY displayNotify;
-// Coolant fan curve on motherboard headers (see the Super I/O section).
+// Fan curve: one temperature drives up to MAX_OUT fans (see the Fan hardware section).
 static BOOL hasCurve;
-static int fanCh[7], fanChCount, curveT[MAX_CURVE], curveD[MAX_CURVE], curveN, fanHyst = 2, linkSensor = -1;
-static int fanDuty = -1, tempFails, fanMax = 100, fanRpm[7];
-static WCHAR fanNames[96];
+static int outCount, curveT[MAX_CURVE], curveD[MAX_CURVE], curveN, fanHyst = 2, linkSensor = -1;
+static int fanDuty = -1, tempFails, fanMax = 100, fanRpm[MAX_OUT];
+static WCHAR fanNames[96], outSpec[200], srcSpec[64];
+// What the curve follows, for the panel and the tooltip: "Water" from "the iCUE LINK hub" unless [fans] source= says otherwise.
+static WCHAR srcLabel[24] = L"Water", srcFrom[48] = L"the iCUE LINK hub";
 static double coolant = -1;
 // Coolant history for the panel graph: 15 min at one sample per 4 s tick, C x100.
 #define HISTORY 225
@@ -65,7 +71,8 @@ static HWND panel;
 static void panelUpdate(void);
 // Cached switches, so the 4 s tick never reads the registry. Written through to HKCU when changed.
 static BOOL litOn = TRUE, litWant = TRUE, curveOn = TRUE, linkOk;
-// Why the coolant fan curve is off (shown in the panel): 0 active, 1 no [fans], 2 not admin, 3 PawnIO or module missing, 4 no chip.
+// Why the fan curve is off (shown in the panel): 0 active, 1 no [fans], 2 not admin, 3 PawnIO or module missing, 4 no known
+// fan chip, 5 a fan or sensor named in blackout.ini is not there, 6 the definition is untested and untested=1 is not set.
 static int fanWhy = 1;
 // What woke the screens (panel > Settings > Wake). Kept in memory only, newest first.
 #define MAX_WAKES 5
@@ -250,12 +257,19 @@ static void loadConfig(void) {
     ddcOff = GetPrivateProfileIntW(L"ddc", L"off", 4, iniPath);
     linkLeds = GetPrivateProfileIntW(L"link", L"leds", 0, iniPath);
     if (linkLeds > MAX_LINK_LEDS) linkLeds = MAX_LINK_LEDS;
-    // [fans] channels=1,3,4  curve=30:40,45:100  (coolant C : duty %)
+    // [fans] outputs=sio/2,sio/4  source=link  curve=30:40,45:100  (temperature C : duty %). See docs/devices.md.
     WCHAR list[128], *tok, *ctx;
-    fanChCount = 0;
-    GetPrivateProfileStringW(L"fans", L"channels", L"", list, 128, iniPath);
-    for (tok = wcstok(list, L", ", &ctx); tok && fanChCount < 7; tok = wcstok(NULL, L", ", &ctx))
-        if (*tok >= L'0' && *tok <= L'6') fanCh[fanChCount++] = *tok - L'0';
+    GetPrivateProfileStringW(L"fans", L"outputs", L"", outSpec, 200, iniPath);
+    if (!outSpec[0]) {
+        // From before definitions: channels=1,3,4 are Nuvoton fan channels counted from 0.
+        GetPrivateProfileStringW(L"fans", L"channels", L"", list, 128, iniPath);
+        for (tok = wcstok(list, L", ", &ctx); tok && lstrlenW(outSpec) < 180; tok = wcstok(NULL, L", ", &ctx))
+            if (*tok >= L'0' && *tok <= L'6') wsprintfW(outSpec + lstrlenW(outSpec), L"%ssio/%d", outSpec[0] ? L"," : L"", *tok - L'0' + 1);
+    }
+    outCount = outSpec[0] != 0;
+    for (WCHAR *c = outSpec; *c; c++) outCount += *c == L',';
+    if (outCount > MAX_OUT) outCount = MAX_OUT;
+    GetPrivateProfileStringW(L"fans", L"source", L"link", srcSpec, 64, iniPath);
     // A curve edited in the panel is kept in HKCU\Software\Blackout\Curve and wins over the ini.
     DWORD n = sizeof(list);
     if (RegGetValueW(HKEY_CURRENT_USER, APP_KEY, L"Curve", RRF_RT_REG_SZ, NULL, list, &n) != ERROR_SUCCESS)
@@ -266,7 +280,7 @@ static void loadConfig(void) {
     if (fanMax < 20 || fanMax > 100) fanMax = 100;
     fanHyst = (int)getDword(L"Hysteresis", GetPrivateProfileIntW(L"fans", L"hysteresis", 2, iniPath));
     if (fanHyst < 0 || fanHyst > 10) fanHyst = 2;
-    // Optional chain names for the panel, in channel order: names=Top,Side,Bottom
+    // Optional names for the panel, in the order of outputs=: names=Top,Side,Bottom
     GetPrivateProfileStringW(L"fans", L"names", L"", fanNames, 96, iniPath);
     linkSensor = GetPrivateProfileIntW(L"fans", L"sensor", -1, iniPath);
 }
@@ -325,22 +339,28 @@ static HANDLE openHid(LPCWSTR id, LPCWSTR iface, DWORD flags) {
 // colour frame, so Blackout re-sends the frame every few seconds. Each tick is four tiny HID transactions.
 static HANDLE ioEvent;
 
-static BOOL linkIo(BYTE *out, BYTE *in) {
+// One HID exchange with 1 s timeouts: send a report (if any), then read one (if wanted).
+static BOOL hidIo(HANDLE h, const BYTE *out, DWORD outLen, BYTE *in, DWORD inLen) {
     OVERLAPPED ov = {0};
     DWORD n;
+    BOOL ok = TRUE;
     if (!ioEvent) ioEvent = CreateEventW(NULL, TRUE, FALSE, NULL); // one event for the life of the process
-    ResetEvent(ioEvent);
     ov.hEvent = ioEvent;
-    BOOL ok = WriteFile(link, out, 513, NULL, &ov) || GetLastError() == ERROR_IO_PENDING;
-    ok = ok && WaitForSingleObject(ov.hEvent, 1000) == WAIT_OBJECT_0 && GetOverlappedResult(link, &ov, &n, FALSE);
-    if (ok) {
-        ResetEvent(ov.hEvent);
-        ok = ReadFile(link, in, 513, NULL, &ov) || GetLastError() == ERROR_IO_PENDING;
-        ok = ok && WaitForSingleObject(ov.hEvent, 1000) == WAIT_OBJECT_0 && GetOverlappedResult(link, &ov, &n, FALSE);
+    if (out) {
+        ResetEvent(ioEvent);
+        ok = WriteFile(h, out, outLen, NULL, &ov) || GetLastError() == ERROR_IO_PENDING;
+        ok = ok && WaitForSingleObject(ioEvent, 1000) == WAIT_OBJECT_0 && GetOverlappedResult(h, &ov, &n, FALSE);
     }
-    if (!ok) CancelIo(link);
+    if (ok && in) {
+        ResetEvent(ioEvent);
+        ok = ReadFile(h, in, inLen, NULL, &ov) || GetLastError() == ERROR_IO_PENDING;
+        ok = ok && WaitForSingleObject(ioEvent, 1000) == WAIT_OBJECT_0 && GetOverlappedResult(h, &ov, &n, FALSE);
+    }
+    if (!ok) CancelIo(h);
     return ok;
 }
+
+static BOOL linkIo(BYTE *out, BYTE *in) { return hidIo(link, out, 513, in, 513); }
 
 static BOOL linkCmd(const BYTE *cmd, int cmdLen, const BYTE *data, int dataLen) {
     BYTE out[513] = {0}, in[513];
@@ -373,16 +393,7 @@ static BOOL linkRefresh(void) {
     return linkOk = litOn ? linkColor(color[0], color[1], color[2]) : linkColor(0, 0, 0);
 }
 
-static BOOL linkReadMore(BYTE *in) {
-    OVERLAPPED ov = {0};
-    DWORD n;
-    ResetEvent(ioEvent);
-    ov.hEvent = ioEvent;
-    BOOL ok = ReadFile(link, in, 513, NULL, &ov) || GetLastError() == ERROR_IO_PENDING;
-    ok = ok && WaitForSingleObject(ov.hEvent, 1000) == WAIT_OBJECT_0 && GetOverlappedResult(link, &ov, &n, FALSE);
-    if (!ok) CancelIo(link);
-    return ok;
-}
+static BOOL linkReadMore(BYTE *in) { return hidIo(link, NULL, 0, in, 513); }
 
 // Coolant temperature from the LINK hub (protocol from FanControl.CorsairLink): endpoint 21, data type 10 00.
 // Reply: [4] status, [5..6] data type, [7] sensor count, then 3 bytes per sensor: status (0 = present), int16 LE C x10.
@@ -419,54 +430,78 @@ static BOOL linkTemp(double *t) {
     return got;
 }
 
-// Motherboard fan headers on a Nuvoton NCT679x Super I/O, through PawnIO's LpcIO module (PawnIO must be installed,
-// Blackout must run as admin). Register map as in Linux nct6775 and LibreHardwareMonitor: per-channel pages
-// 0x100..0xB00, mode at page+0x02 (bits 7..4, 0 = manual), duty at page+0x09 (0..255), RPM at 0x4C0 + 2 * channel.
-// Access is shared with HWiNFO/LHM through the standard ISA bus mutex.
+// ---- Fan hardware ----
+// What Blackout knows about a fan chip or a USB controller comes from a definition file (devices.c). This part joins
+// those to Windows: Super I/O ports through PawnIO's LpcIO module (PawnIO installed, Blackout run as admin, access
+// shared with HWiNFO and LibreHardwareMonitor through the standard ISA bus mutex), and HID reports.
+#include "devices.c"
+
 typedef HRESULT(WINAPI *PioOpen)(PHANDLE);
 typedef HRESULT(WINAPI *PioLoad)(HANDLE, const UCHAR *, SIZE_T);
 typedef HRESULT(WINAPI *PioExec)(HANDLE, PCSTR, const ULONG64 *, SIZE_T, PULONG64, SIZE_T, PSIZE_T);
+typedef struct { HANDLE h; OVERLAPPED ov; BOOL reading; BYTE buf[DEV_REPORT]; } HidHost;
+typedef struct { char dev[40], item[DEV_NAME]; } FanRef;
 static PioExec pioExec;
-static HANDLE pio, isaMutex;
-static int sioBase;
-static BYTE fanSavedMode[7], fanSavedDuty[7];
+static HANDLE isaMutex;
+static struct { Dev *dev; int fan; } outs[MAX_OUT];
+static Dev *srcDev; // NULL = the iCUE LINK hub's coolant sensor
+static int srcTemp;
 static BOOL fanManual;
-static const int fanPage[7] = {0x100, 0x200, 0x300, 0x800, 0x900, 0xA00, 0xB00};
+// Every definition, while setup or --devices is running. Freed afterwards.
+static Dev *defs;
+static int defCount;
 
-static ULONG64 pioCall(PCSTR fn, ULONG64 a, ULONG64 b, SIZE_T nin) {
+// What a motherboard fan's registers held before Blackout took it is also noted in a registry key that lasts until
+// shutdown (HKLM, volatile). If Blackout is killed while it holds a fan, the next start finds the fan in manual mode
+// and, with the note, can still hand it back as the BIOS had it. Without a note, manual mode is the BIOS's own setting.
+#define HELD_KEY L"SOFTWARE\\Blackout\\Held"
+
+static BOOL heldRead(int i, BYTE *was) {
+    WCHAR name[80];
+    DWORD v, n = sizeof(v);
+    wsprintfW(name, L"%S/%d", outs[i].dev->file, outs[i].fan + 1);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, HELD_KEY, name, RRF_RT_REG_DWORD, NULL, &v, &n) != ERROR_SUCCESS) return FALSE;
+    was[0] = (BYTE)v, was[1] = (BYTE)(v >> 8), was[2] = (BYTE)(v >> 16);
+    return TRUE;
+}
+
+static void heldWrite(int i, BOOL held) {
+    const DevFan *f = &outs[i].dev->fans[outs[i].fan];
+    WCHAR name[80];
+    HKEY key;
+    DWORD v = f->savedMode | f->savedDuty << 8 | f->savedEnable << 16;
+    wsprintfW(name, L"%S/%d", outs[i].dev->file, outs[i].fan + 1);
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, HELD_KEY, 0, NULL, REG_OPTION_VOLATILE, KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS) return;
+    if (held) RegSetValueExW(key, name, 0, REG_DWORD, (BYTE *)&v, sizeof(v));
+    else RegDeleteValueW(key, name);
+    RegCloseKey(key);
+}
+
+static ULONG64 pioCall(HANDLE h, PCSTR fn, ULONG64 a, ULONG64 b, SIZE_T nin) {
     ULONG64 in[2] = {a, b}, out = 0;
     SIZE_T n;
-    pioExec(pio, fn, in, nin, &out, 1, &n);
+    pioExec(h, fn, in, nin, &out, 1, &n);
     return out;
 }
+
+static int hostIn(void *h, int port) { return (int)pioCall(h, "ioctl_pio_inb", port, 0, 1); }
+static void hostOut(void *h, int port, int v) { pioCall(h, "ioctl_pio_outb", port, v, 2); }
+static void hostSlot(void *h, int slot) { pioCall(h, "ioctl_select_slot", slot, 0, 1); }
+static void hostBars(void *h) { pioCall(h, "ioctl_find_bars", 0, 0, 0); }
 
 static BOOL isaLock(void) {
     DWORD r = WaitForSingleObject(isaMutex, 500);
     return r == WAIT_OBJECT_0 || r == WAIT_ABANDONED;
 }
 
-static void hwmSelect(int reg) {
-    pioCall("ioctl_pio_outb", sioBase + 5, 0x4E, 2);
-    pioCall("ioctl_pio_outb", sioBase + 6, reg >> 8, 2);
-    pioCall("ioctl_pio_outb", sioBase + 5, reg & 0xFF, 2);
-}
-
-static int hwmRead(int reg) {
-    hwmSelect(reg);
-    return (int)pioCall("ioctl_pio_inb", sioBase + 6, 0, 1);
-}
-
-static void hwmWrite(int reg, int v) {
-    hwmSelect(reg);
-    pioCall("ioctl_pio_outb", sioBase + 6, v, 2);
-}
-
-static BOOL sioInit(void) {
+// A PawnIO handle with the LpcIO module loaded, or NULL with fanWhy saying why. One handle drives one config port.
+static HANDLE pioOpen(void) {
     WCHAR raw[MAX_PATH], path[MAX_PATH];
+    HANDLE h = NULL;
     ExpandEnvironmentStringsW(L"%ProgramFiles%\\PawnIO\\PawnIOLib.dll", path, MAX_PATH);
     fanWhy = 3;
     HMODULE lib = LoadLibraryW(path);
-    if (!lib) return FALSE;
+    if (!lib) return NULL;
     PioOpen pOpen = (PioOpen)GetProcAddress(lib, "pawnio_open");
     PioLoad pLoad = (PioLoad)GetProcAddress(lib, "pawnio_load");
     pioExec = (PioExec)GetProcAddress(lib, "pawnio_execute");
@@ -474,73 +509,416 @@ static BOOL sioInit(void) {
     if (raw[0]) ExpandEnvironmentStringsW(raw, path, MAX_PATH);
     else exeDir(path, L"LpcIO.bin");
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (!pOpen || !pLoad || !pioExec || f == INVALID_HANDLE_VALUE) return FALSE;
+    if (f == INVALID_HANDLE_VALUE) return NULL;
     DWORD size = GetFileSize(f, NULL), got = 0;
     UCHAR *blob = HeapAlloc(GetProcessHeap(), 0, size);
-    BOOL ok = blob && ReadFile(f, blob, size, &got, NULL) && got == size;
+    BOOL ok = pOpen && pLoad && pioExec && blob && ReadFile(f, blob, size, &got, NULL) && got == size;
     CloseHandle(f);
-    ok = ok && pOpen(&pio) == S_OK && pLoad(pio, blob, size) == S_OK;
+    ok = ok && pOpen(&h) == S_OK && pLoad(h, blob, size) == S_OK;
     if (blob) HeapFree(GetProcessHeap(), 0, blob);
-    if (!ok) {
-        if (!isElevated()) fanWhy = 2;
-        return FALSE;
-    }
-    fanWhy = 4;
-    isaMutex = CreateMutexW(NULL, FALSE, L"Global\\Access_ISABUS.HTP.Method");
-    for (int slot = 0; slot < 2 && !sioBase && isaLock(); slot++) {
-        int port = slot ? 0x4E : 0x2E;
-        pioCall("ioctl_select_slot", slot, 0, 1);
-        pioCall("ioctl_pio_outb", port, 0x87, 2);
-        pioCall("ioctl_pio_outb", port, 0x87, 2);
-        int id = (int)pioCall("ioctl_superio_inb", 0x20, 0, 1);
-        if (id == 0xD4 || id == 0xD8) {
-            pioCall("ioctl_superio_outb", 0x07, 0x0B, 2);
-            int base = (int)(pioCall("ioctl_superio_inb", 0x60, 0, 1) << 8 | pioCall("ioctl_superio_inb", 0x61, 0, 1));
-            int lock = (int)pioCall("ioctl_superio_inb", 0x28, 0, 1);
-            if (lock & 0x10) pioCall("ioctl_superio_outb", 0x28, lock & ~0x10, 2);
-            pioCall("ioctl_find_bars", 0, 0, 0);
-            if (base > 0x100 && base < 0xFFF8) sioBase = base;
-        }
-        pioCall("ioctl_pio_outb", port, 0xAA, 2);
-        ReleaseMutex(isaMutex);
-    }
-    if (sioBase) fanWhy = 0;
-    return sioBase != 0;
+    if (ok) return h;
+    if (h) CloseHandle(h);
+    if (!isElevated()) fanWhy = 2;
+    return NULL;
 }
 
-static void fansSet(int duty) {
-    if (!isaLock()) return;
-    for (int i = 0; i < fanChCount; i++) {
-        int page = fanPage[fanCh[i]];
-        if (!fanManual) {
-            fanSavedMode[i] = (BYTE)hwmRead(page + 0x02);
-            fanSavedDuty[i] = (BYTE)hwmRead(page + 0x09);
-            // Already manual means an earlier instance was killed before it could hand back. Restore to the BIOS
-            // SmartFan IV curve (mode 4) at full duty rather than freezing the fans at a stale manual duty.
-            if (!(fanSavedMode[i] & 0xF0)) fanSavedMode[i] |= 0x40, fanSavedDuty[i] = 0xFF;
-        }
-        hwmWrite(page + 0x02, fanSavedMode[i] & 0x0F);
-        hwmWrite(page + 0x09, duty * 255 / 100);
+static void hidDrop(HidHost *s) {
+    if (s->h != INVALID_HANDLE_VALUE) {
+        CancelIo(s->h);
+        CloseHandle(s->h);
+        s->h = INVALID_HANDLE_VALUE;
     }
-    hwmSelect(0);
-    ReleaseMutex(isaMutex);
-    fanManual = TRUE;
+    s->reading = FALSE;
+}
+
+static int hostHid(void *host, const unsigned char *out, int outLen, unsigned char *in, int inLen) {
+    HidHost *s = host;
+    if (s->h == INVALID_HANDLE_VALUE) return 0;
+    if (hidIo(s->h, out, outLen, in, inLen)) return 1;
+    hidDrop(s); // unplugged or not answering: opened again on the next use
+    return 0;
+}
+
+// Opens the HID interface a definition describes: its VID, one of its PIDs, the interface text if given, and reports
+// large enough for the definition's commands and fields. Report sizes come from Windows, not from the file.
+static BOOL hidOpen(Dev *d) {
+    HidHost *s = d->host;
+    GUID g;
+    int cmd = d->set.len > d->rpmCmd.len ? d->set.len : d->rpmCmd.len;
+    if (d->tempCmd.len > cmd) cmd = d->tempCmd.len;
+    HidD_GetHidGuid(&g);
+    HDEVINFO set = SetupDiGetClassDevsW(&g, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) return FALSE;
+    SP_DEVICE_INTERFACE_DATA ifd = {sizeof(ifd)};
+    for (DWORD i = 0; s->h == INVALID_HANDLE_VALUE && SetupDiEnumDeviceInterfaces(set, NULL, &g, i, &ifd); i++) {
+        union { SP_DEVICE_INTERFACE_DETAIL_DATA_W d; BYTE raw[1024]; } u;
+        WCHAR id[24], iface[16];
+        BOOL match = FALSE;
+        PHIDP_PREPARSED_DATA parsed;
+        HIDP_CAPS caps;
+        u.d.cbSize = sizeof(u.d);
+        if (!SetupDiGetDeviceInterfaceDetailW(set, &ifd, &u.d, sizeof(u), NULL, NULL)) continue;
+        CharLowerW(u.d.DevicePath);
+        for (int p = 0; p < d->pids && !match; p++) {
+            wsprintfW(id, L"vid_%04x&pid_%04x", d->vid, d->pid[p]);
+            match = wcsstr(u.d.DevicePath, id) != NULL;
+        }
+        if (match && d->iface[0]) {
+            MultiByteToWideChar(CP_ACP, 0, d->iface, -1, iface, 16);
+            match = wcsstr(u.d.DevicePath, iface) != NULL;
+        }
+        if (!match) continue;
+        HANDLE h = CreateFileW(u.d.DevicePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        if (HidD_GetPreparsedData(h, &parsed)) {
+            if (HidP_GetCaps(parsed, &caps) == HIDP_STATUS_SUCCESS && caps.InputReportByteLength >= d->inNeed && caps.InputReportByteLength <= DEV_REPORT &&
+                caps.OutputReportByteLength <= DEV_REPORT && (!cmd || caps.OutputReportByteLength > cmd)) {
+                s->h = h;
+                d->inLen = caps.InputReportByteLength ? caps.InputReportByteLength - 1 : 0;
+                d->outLen = caps.OutputReportByteLength ? caps.OutputReportByteLength - 1 : 0;
+            }
+            HidD_FreePreparsedData(parsed);
+        }
+        if (s->h == INVALID_HANDLE_VALUE) CloseHandle(h);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    if (s->h == INVALID_HANDLE_VALUE) return FALSE;
+    // A controller that reports on its own: keep only the newest reports queued, so a 4 s tick never reads old ones.
+    if (d->fanIn.listen || d->tempIn.listen) HidD_SetNumInputBuffers(s->h, 2);
+    return TRUE;
+}
+
+// Takes in the reports a controller has sent on its own since the last call, without waiting (or for up to wait ms
+// for the first one). One read is always left pending. FALSE = the device is gone.
+static BOOL hidPump(Dev *d, DWORD wait) {
+    HidHost *s = d->host;
+    DWORD n;
+    for (int i = 0; i < 16; i++) {
+        if (!s->reading) {
+            ResetEvent(s->ov.hEvent);
+            if (!ReadFile(s->h, s->buf, d->inLen + 1, NULL, &s->ov) && GetLastError() != ERROR_IO_PENDING) break;
+            s->reading = TRUE;
+        }
+        if (wait) WaitForSingleObject(s->ov.hEvent, wait), wait = 0;
+        if (!GetOverlappedResult(s->h, &s->ov, &n, FALSE)) {
+            if (GetLastError() == ERROR_IO_INCOMPLETE) return TRUE;
+            break;
+        }
+        s->reading = FALSE;
+        devHidReport(d, s->buf, (int)n);
+    }
+    if (!s->reading) return TRUE; // 16 reports and still more: enough for now
+    hidDrop(s);
+    return FALSE;
+}
+
+static BOOL hidAttach(Dev *d) {
+    HidHost *s = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(HidHost));
+    if (!s) return FALSE;
+    s->h = INVALID_HANDLE_VALUE;
+    s->ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    d->host = s;
+    return TRUE;
+}
+
+static void hidDetach(Dev *d) {
+    HidHost *s = d->host;
+    hidDrop(s);
+    CloseHandle(s->ov.hEvent);
+    HeapFree(GetProcessHeap(), 0, s);
+    d->host = NULL;
+}
+
+// Before a device is used in a tick. A USB controller is opened again if it went away, and its own reports taken in.
+static BOOL devReady(Dev *d) {
+    HidHost *s = d->host;
+    if (d->type == DEV_SIO) return TRUE;
+    if (s->h == INVALID_HANDLE_VALUE && !hidOpen(d)) return FALSE;
+    return !(d->fanIn.listen || d->tempIn.listen) || hidPump(d, 0);
+}
+
+static void defAdd(char *text, const char *name, char *errors, int cap) {
+    if (!(defCount % 16)) {
+        SIZE_T size = (defCount + 16) * sizeof(Dev);
+        Dev *more = defs ? HeapReAlloc(GetProcessHeap(), 0, defs, size) : HeapAlloc(GetProcessHeap(), 0, size);
+        if (!more) return;
+        defs = more;
+    }
+    if (devParse(&defs[defCount], text, name)) defCount++;
+    else if (errors && lstrlenA(errors) + lstrlenA(name) + lstrlenA(devErr) + 12 < cap) wsprintfA(errors + lstrlenA(errors), "  %s.ini: %s\r\n", name, devErr);
+}
+
+// Reads every definition in the devices folder beside the exe, then the built-in one. Files that don't parse are
+// skipped, and listed in errors when the caller wants to know.
+static void defsLoad(char *errors, int cap) {
+    enum { LIMIT = 16384 };
+    WCHAR path[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    char name[64], *text = HeapAlloc(GetProcessHeap(), 0, LIMIT + 1);
+    if (!text) return;
+    exeDir(path, L"devices\\*.ini");
+    HANDLE find = FindFirstFileW(path, &fd);
+    for (BOOL more = find != INVALID_HANDLE_VALUE; more; more = FindNextFileW(find, &fd)) {
+        DWORD got = 0;
+        int len = lstrlenW(fd.cFileName) - 4;
+        if (len < 1 || len > 39 || fd.nFileSizeLow > LIMIT || fd.nFileSizeHigh) continue;
+        exeDir(path, L"devices\\");
+        lstrcatW(path, fd.cFileName);
+        HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        BOOL ok = ReadFile(f, text, LIMIT, &got, NULL);
+        CloseHandle(f);
+        if (!ok) continue;
+        text[got] = 0;
+        WideCharToMultiByte(CP_ACP, 0, fd.cFileName, len, name, sizeof(name), NULL, NULL);
+        name[len] = 0;
+        CharLowerA(name);
+        defAdd(text, name, errors, cap);
+    }
+    if (find != INVALID_HANDLE_VALUE) FindClose(find);
+    memcpy(text, devBuiltin, sizeof(devBuiltin));
+    defAdd(text, "builtin", NULL, 0);
+    HeapFree(GetProcessHeap(), 0, text);
+}
+
+// "sio/2" or "corsair-commander-pro/Fan 1" into its two halves.
+static BOOL refParse(char *spec, FanRef *r) {
+    char *slash = strchr(spec, '/');
+    if (!slash) return FALSE;
+    *slash = 0;
+    return dvText(r->dev, sizeof(r->dev), dvTrim(spec)) && dvText(r->item, sizeof(r->item), dvTrim(slash + 1));
+}
+
+// The definition a name in blackout.ini means: "sio" is the fan chip that was found, anything else a file name.
+static Dev *defFind(const char *name, int chip0, int chip1) {
+    if (dvSame(name, "sio")) return chip0 >= 0 ? &defs[chip0] : chip1 >= 0 ? &defs[chip1] : NULL;
+    for (int i = 0; i < defCount; i++)
+        if (dvSame(defs[i].file, name)) return &defs[i];
+    return NULL;
+}
+
+// Works out what [fans] in blackout.ini means on this machine and gets that hardware ready. FALSE, with fanWhy set,
+// when the curve can't run. Afterwards only the definitions in use are still in memory.
+static BOOL fansInit(void) {
+    char spec[200], src[64], *list = spec, *tok;
+    FanRef refs[MAX_OUT + 1]; // the outputs, then the source
+    Dev *used[MAX_OUT + 1], *kept[MAX_OUT + 1];
+    HANDLE pio[2] = {NULL, NULL};
+    int n = 0, total, chip[2] = {-1, -1}, id;
+    BOOL untested = GetPrivateProfileIntW(L"fans", L"untested", 0, iniPath), needSio = FALSE, second = FALSE, ok = FALSE;
+    WideCharToMultiByte(CP_ACP, 0, outSpec, -1, spec, sizeof(spec), NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, srcSpec, -1, src, sizeof(src), NULL, NULL);
+    fanWhy = 5;
+    while (n < MAX_OUT && (tok = dvCut(&list, ',')))
+        if (*tok && !refParse(tok, &refs[n++])) return FALSE;
+    total = n;
+    if (!dvSame(dvTrim(src), "link") && !refParse(src, &refs[total++])) return FALSE;
+    outCount = n;
+    if (!n) return FALSE;
+    defsLoad(NULL, 0);
+    for (int i = 0; i < total; i++) {
+        Dev *d = defFind(refs[i].dev, -1, -1);
+        needSio |= dvSame(refs[i].dev, "sio") || (d && d->type == DEV_SIO);
+    }
+    if (needSio) {
+        if (!(pio[0] = pioOpen())) goto done;
+        fanWhy = 4;
+        isaMutex = CreateMutexW(NULL, FALSE, L"Global\\Access_ISABUS.HTP.Method");
+        if (!isaLock()) goto done;
+        chip[0] = sioProbe(pio[0], 0, defs, defCount, &id);
+        // The second config port is looked at only when something in blackout.ini is not behind the first.
+        for (int i = 0; i < total; i++) {
+            Dev *d = defFind(refs[i].dev, chip[0], -1);
+            second |= dvSame(refs[i].dev, "sio") ? chip[0] < 0 : d && d->type == DEV_SIO && !d->host;
+        }
+        if (second && (pio[1] = chip[0] < 0 ? pio[0] : pioOpen())) chip[1] = sioProbe(pio[1], 1, defs, defCount, &id);
+        ReleaseMutex(isaMutex);
+    }
+    for (int i = 0; i < total; i++) {
+        Dev *d = used[i] = defFind(refs[i].dev, chip[0], chip[1]);
+        BOOL sio = dvSame(refs[i].dev, "sio") || (d && d->type == DEV_SIO);
+        fanWhy = sio ? 4 : 5;
+        if (!d || (sio && !d->host)) goto done;
+        fanWhy = 5;
+        // A USB controller that is not there yet (early in logon) is opened by a later tick.
+        if (d->type == DEV_HID && !d->host && !hidAttach(d)) goto done;
+        if (i < n) {
+            outs[i].fan = devFindFan(d, refs[i].item);
+            if (outs[i].fan < 0 || !d->fans[outs[i].fan].control) goto done;
+            fanWhy = 6;
+            if (!d->verified && !untested) goto done;
+        } else if ((srcTemp = devFindTemp(d, refs[i].item)) < 0) {
+            goto done;
+        }
+    }
+    ok = TRUE;
+    for (int i = 0; i < total; i++) {
+        kept[i] = NULL;
+        for (int k = 0; k < i; k++)
+            if (used[k] == used[i]) kept[i] = kept[k];
+        if (!kept[i] && (kept[i] = HeapAlloc(GetProcessHeap(), 0, sizeof(Dev)))) *kept[i] = *used[i];
+        ok = ok && kept[i];
+    }
+done:
+    for (int i = 0; i < defCount; i++) {
+        BOOL inUse = FALSE;
+        for (int k = 0; ok && k < total; k++) inUse |= used[k] == &defs[i];
+        if (defs[i].type == DEV_HID && defs[i].host && !inUse) hidDetach(&defs[i]);
+    }
+    for (int s = 0; s < 2; s++) {
+        BOOL inUse = FALSE;
+        for (int k = 0; ok && k < total; k++) inUse |= used[k]->host == pio[s];
+        if (pio[s] && !inUse && (!s || pio[1] != pio[0])) CloseHandle(pio[s]);
+    }
+    if (defs) HeapFree(GetProcessHeap(), 0, defs);
+    defs = NULL, defCount = 0;
+    if (!ok) return FALSE;
+    for (int i = 0; i < n; i++) outs[i].dev = kept[i];
+    if (total > n) {
+        srcDev = kept[n];
+        MultiByteToWideChar(CP_ACP, 0, srcDev->temps[srcTemp].name, -1, srcLabel, 24);
+        MultiByteToWideChar(CP_ACP, 0, srcDev->name, -1, srcFrom, 48);
+    }
+    fanWhy = 0;
+    return TRUE;
+}
+
+// The temperature that drives the curve.
+static BOOL tempRead(double *t) {
+    BOOL ok;
+    if (!srcDev) return linkTemp(t);
+    if (srcDev->type == DEV_SIO && !isaLock()) return FALSE;
+    ok = devReady(srcDev) && devTempRead(srcDev, srcTemp, t) && *t > 0 && *t < 120;
+    devEnd(srcDev);
+    if (srcDev->type == DEV_SIO) ReleaseMutex(isaMutex);
+    return ok;
+}
+
+// Chips are left the way other software expects after each run of accesses to one device (devEnd).
+static void fansSet(int duty) {
+    BOOL all = TRUE, ready = FALSE;
+    if (isaMutex && !isaLock()) return;
+    for (int i = 0; i < outCount; i++) {
+        Dev *d = outs[i].dev;
+        if (!i || d != outs[i - 1].dev) ready = devReady(d) && devSafe(d);
+        if (ready && d->type == DEV_SIO && !d->fans[outs[i].fan].taken) {
+            BYTE was[3];
+            devFanSave(d, outs[i].fan, heldRead(i, was) ? was : NULL);
+            heldWrite(i, TRUE);
+        }
+        if (ready && devFanSet(d, outs[i].fan, duty)) fanManual = TRUE;
+        else all = FALSE;
+        if (i == outCount - 1 || d != outs[i + 1].dev) devEnd(d);
+    }
+    if (isaMutex) ReleaseMutex(isaMutex);
+    if (!all) return; // a fan was not reached: fanDuty stays as it was, so the next tick tries again
     fanDuty = duty;
     setDword(L"FanDuty", duty);
 }
 
-// Hand the headers back to the BIOS curve exactly as found.
+// Hand the fans back exactly as found (motherboard headers return to the BIOS curve).
 static void fansRelease(void) {
-    if (!fanManual || !isaLock()) return;
-    for (int i = 0; i < fanChCount; i++) {
-        hwmWrite(fanPage[fanCh[i]] + 0x09, fanSavedDuty[i]);
-        hwmWrite(fanPage[fanCh[i]] + 0x02, fanSavedMode[i]);
+    if (!fanManual || (isaMutex && !isaLock())) return;
+    for (int i = 0; i < outCount; i++) {
+        devFanRelease(outs[i].dev, outs[i].fan);
+        if (outs[i].dev->type == DEV_SIO) heldWrite(i, FALSE);
+        if (i == outCount - 1 || outs[i].dev != outs[i + 1].dev) devEnd(outs[i].dev);
     }
-    hwmSelect(0);
-    ReleaseMutex(isaMutex);
+    if (isaMutex) ReleaseMutex(isaMutex);
     fanManual = FALSE;
     fanDuty = -1;
     setDword(L"FanDuty", 0);
+}
+
+// After sleep the chip is back under BIOS control: what was saved before no longer describes it.
+static void fansForget(void) {
+    for (int i = 0; i < outCount; i++) outs[i].dev->fans[outs[i].fan].taken = 0;
+    fanManual = FALSE;
+    fanDuty = -1;
+}
+
+// Fan RPM for the panel only; read while it is open.
+static void fansReadRpm(void) {
+    BOOL ready = FALSE;
+    if (isaMutex && !isaLock()) return;
+    for (int i = 0; i < outCount; i++) {
+        Dev *d = outs[i].dev;
+        if (!i || d != outs[i - 1].dev) ready = devReady(d);
+        fanRpm[i] = ready ? devFanRpm(d, outs[i].fan) : 0;
+        if (i == outCount - 1 || d != outs[i + 1].dev) devEnd(d);
+    }
+    if (isaMutex) ReleaseMutex(isaMutex);
+}
+
+static int reportDev(char *out, int n, Dev *d) {
+    double c;
+    n += wsprintfA(out + n, "%s (%s%s, %s)\r\n", d->name, d->file, lstrcmpA(d->file, "builtin") ? ".ini" : "", d->verified ? "verified" : "untested");
+    for (int i = 0; i < d->fanCount; i++) {
+        DevFan *f = &d->fans[i];
+        n += wsprintfA(out + n, "  fan %2d   %-22s %5d rpm", i + 1, f->name, devFanRpm(d, i));
+        if (d->type == DEV_SIO && f->control) {
+            int mode = sioRead(d, f->mode);
+            n += wsprintfA(out + n, "   duty %3d%%   mode %02X", sioRead(d, f->duty) * 100 / 255, mode);
+        }
+        n += wsprintfA(out + n, "   %s\r\n", f->control ? "can be controlled" : "read only");
+    }
+    for (int i = 0; i < d->tempCount; i++) {
+        n += wsprintfA(out + n, "  temp %2d  %-22s ", i + 1, d->temps[i].name);
+        if (devTempRead(d, i, &c)) {
+            int tenths = (int)(c * 10 + (c < 0 ? -0.5 : 0.5));
+            n += wsprintfA(out + n, "%s%d.%d C\r\n", tenths < 0 ? "-" : "", (tenths < 0 ? -tenths : tenths) / 10, (tenths < 0 ? -tenths : tenths) % 10);
+        } else {
+            n += wsprintfA(out + n, "no reading\r\n");
+        }
+    }
+    if (d->guards) n += wsprintfA(out + n, "  %s\r\n", devSafe(d) ? "guard: control allowed" : "guard: control refused, the chip is not in the state this definition assumes");
+    devEnd(d);
+    return n;
+}
+
+// blackout.exe --devices: what Blackout sees on this machine, written to %TEMP%\blackout-devices.txt and opened.
+// Reads only. Safe beside a running Blackout (same mutex).
+static int devicesReport(void) {
+    enum { REPORT = 65536, ERRORS = 8192 };
+    WCHAR path[MAX_PATH];
+    DWORD w;
+    char *out = HeapAlloc(GetProcessHeap(), 0, REPORT), *errors = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ERRORS);
+    int n, id;
+    if (!out || !errors) return 1;
+    loadConfig();
+    defsLoad(errors, ERRORS);
+    n = wsprintfA(out, "Blackout device report\r\n%d definitions read from the devices folder\r\n", defCount - 1);
+    n += wsprintfA(out + n, "In blackout.ini: outputs=sio/<fan number>,...  and  source=sio/<temp name>  (docs/devices.md)\r\n");
+    HANDLE pio = pioOpen();
+    if (!pio) n += wsprintfA(out + n, "\r\nMotherboard fan chips: not read. %s\r\n", fanWhy == 2 ? "Run this as admin." : "PawnIO or LpcIO.bin is missing.");
+    isaMutex = CreateMutexW(NULL, FALSE, L"Global\\Access_ISABUS.HTP.Method");
+    for (int slot = 0; pio && slot < 2 && isaLock(); slot++) {
+        int m = sioProbe(pio, slot, defs, defCount, &id);
+        n += wsprintfA(out + n, "\r\nConfig port %s: ", slot ? "4E" : "2E");
+        if (m >= 0) n += wsprintfA(out + n, "chip %04X at %03X, ", id, defs[m].base), n = reportDev(out, n, &defs[m]);
+        else if (id) n += wsprintfA(out + n, "chip %04X has no definition. docs/devices.md shows how to add one.\r\n", id);
+        else n += wsprintfA(out + n, "no chip\r\n");
+        ReleaseMutex(isaMutex);
+    }
+    for (int i = 0; i < defCount && n < REPORT - 4096; i++) {
+        Dev *d = &defs[i];
+        if (d->type != DEV_HID || !hidAttach(d)) continue;
+        if (hidOpen(d)) {
+            if (d->fanIn.listen || d->tempIn.listen) hidPump(d, 1500);
+            n += wsprintfA(out + n, "\r\nUSB %04X: ", d->vid);
+            n = reportDev(out, n, d);
+        }
+        hidDetach(d);
+    }
+    if (errors[0]) n += wsprintfA(out + n, "\r\nDefinitions that could not be read:\r\n"), lstrcpynA(out + n, errors, REPORT - n), n += lstrlenA(out + n);
+    GetTempPathW(MAX_PATH, path);
+    lstrcatW(path, L"blackout-devices.txt");
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 1;
+    WriteFile(f, out, n, &w, NULL);
+    CloseHandle(f);
+    if (!wcsstr(GetCommandLineW(), L"quiet")) ShellExecuteW(NULL, L"open", path, NULL, NULL, SW_SHOWNORMAL);
+    return 0;
 }
 
 static int curveRaw(double t) {
@@ -556,42 +934,7 @@ static int curveAt(double t) {
     return d > fanMax ? fanMax : d;
 }
 
-// Fan RPM for the panel only; read while it is open.
-static void fansReadRpm(void) {
-    if (!isaLock()) return;
-    for (int i = 0; i < fanChCount; i++) {
-        int reg = fanCh[i] == 6 ? 0x4CE : 0x4C0 + fanCh[i] * 2; // the seventh channel's RPM is at 4CE, not 4CC
-        fanRpm[i] = hwmRead(reg) << 8 | hwmRead(reg + 1);
-    }
-    hwmSelect(0);
-    ReleaseMutex(isaMutex);
-}
-
-// [fans] dump=1: one-shot read-only dump of each channel's HWM page to %TEMP%\blackout-sio.txt (diagnostics).
-static void sioDump(void) {
-    WCHAR path[MAX_PATH];
-    char line[256];
-    DWORD w;
-    GetTempPathW(MAX_PATH, path);
-    lstrcatW(path, L"blackout-sio.txt");
-    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-    if (f == INVALID_HANDLE_VALUE || !isaLock()) return;
-    for (int c = 0; c < 5; c++) {
-        int n = wsprintfA(line, "ch%d page %03X:", c, fanPage[c]);
-        for (int r = 0; r < 0x20; r++) n += wsprintfA(line + n, " %02X", hwmRead(fanPage[c] + r));
-        line[n++] = '\r', line[n++] = '\n';
-        WriteFile(f, line, n, &w, NULL);
-    }
-    int n = wsprintfA(line, "bank0 00-1F:");
-    for (int r = 0; r < 0x20; r++) n += wsprintfA(line + n, " %02X", hwmRead(r));
-    line[n++] = '\r', line[n++] = '\n';
-    WriteFile(f, line, n, &w, NULL);
-    hwmSelect(0);
-    ReleaseMutex(isaMutex);
-    CloseHandle(f);
-}
-
-// Re-applies the curve to the current coolant reading straight away (used after a panel edit).
+// Re-applies the curve to the current reading straight away (used after a panel edit).
 static void curveApplyNow(void) {
     if (coolant < 0 || !curveOn) return;
     int duty = curveAt(coolant);
@@ -604,17 +947,17 @@ static void tipUpdate(void) {
     int key = coolant < 0 ? -1 : (int)(coolant + 0.5) * 1000 + (fanDuty < 0 ? 999 : fanDuty);
     if (key == shown) return;
     shown = key;
-    if (coolant < 0) lstrcpyW(nid.szTip, L"Blackout \x00B7 No water reading \x00B7 Fans on the BIOS curve");
-    else if (fanDuty < 0) wsprintfW(nid.szTip, L"Blackout \x00B7 Water %d \x00B0" L"C \x00B7 Fans on the BIOS curve", (int)(coolant + 0.5));
-    else wsprintfW(nid.szTip, L"Blackout \x00B7 Water %d \x00B0" L"C \x00B7 Fans %d%%", (int)(coolant + 0.5), fanDuty);
+    if (coolant < 0) lstrcpyW(nid.szTip, L"Blackout \x00B7 No temperature reading \x00B7 Fans on the BIOS curve");
+    else if (fanDuty < 0) wsprintfW(nid.szTip, L"Blackout \x00B7 %s %d \x00B0" L"C \x00B7 Fans on the BIOS curve", srcLabel, (int)(coolant + 0.5));
+    else wsprintfW(nid.szTip, L"Blackout \x00B7 %s %d \x00B0" L"C \x00B7 Fans %d%%", srcLabel, (int)(coolant + 0.5), fanDuty);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
-// Every 4 s: coolant is averaged over ~30 s, fans go up straight away and come down only once the water is
+// Every 4 s: the temperature is averaged over ~30 s, fans go up straight away and come down only once it is
 // [fans] hysteresis C cooler. No reading for 20 s hands the fans back to the BIOS.
 static void fanTick(void) {
     double t;
-    if (linkTemp(&t)) {
+    if (tempRead(&t)) {
         tempFails = 0;
         coolant = coolant < 0 ? t : coolant + (t - coolant) * 0.13;
         static DWORD written = (DWORD)-1;
@@ -799,11 +1142,11 @@ static void showMenu(HWND hwnd) {
     if (hasCurve) {
         HMENU curve = CreatePopupMenu();
         WCHAR label[64];
-        if (coolant < 0) lstrcpyW(label, L"Water: no reading");
-        else if (fanDuty < 0) wsprintfW(label, L"Water %d.%d C, BIOS fans", (int)coolant, (int)(coolant * 10) % 10);
-        else wsprintfW(label, L"Water %d.%d C, fans %d%%", (int)coolant, (int)(coolant * 10) % 10, fanDuty);
+        if (coolant < 0) lstrcpyW(label, L"No temperature reading");
+        else if (fanDuty < 0) wsprintfW(label, L"%s %d.%d C, BIOS fans", srcLabel, (int)coolant, (int)(coolant * 10) % 10);
+        else wsprintfW(label, L"%s %d.%d C, fans %d%%", srcLabel, (int)coolant, (int)(coolant * 10) % 10, fanDuty);
         AppendMenuW(curve, MF_STRING | MF_GRAYED, 0, label);
-        AppendMenuW(curve, MF_STRING | (curveOn ? MF_CHECKED : 0), ID_CURVE, L"Follow water temperature");
+        AppendMenuW(curve, MF_STRING | (curveOn ? MF_CHECKED : 0), ID_CURVE, L"Follow the temperature");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)curve, L"Fan curve");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -962,6 +1305,14 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (curveOn) fanTick();
             else fansRelease(), tipUpdate();
             return 0;
+        case ID_DEVICES: {
+            // Write the device report from this (elevated) instance, without opening it. For checking a machine remotely.
+            WCHAR cmd[MAX_PATH + 32] = L"\"";
+            GetModuleFileNameW(NULL, cmd + 1, MAX_PATH);
+            lstrcatW(cmd, L"\" --devices quiet");
+            spawn(cmd);
+            return 0;
+        }
         case ID_STARTUP: toggleStartup(); return 0;
         case ID_EXIT: DestroyWindow(hwnd); return 0;
         }
@@ -974,7 +1325,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Also re-applies fan duty after resume, since the Commander Pro resets to its default on power loss.
         // Sleep: give the headers back to the BIOS. The chip resets on resume, so the next tick takes over afresh.
         if (wp == PBT_APMSUSPEND) fansRelease();
-        if (wp == PBT_APMRESUMEAUTOMATIC) fanManual = FALSE, fanDuty = -1;
+        if (wp == PBT_APMRESUMEAUTOMATIC) fansForget();
         if (wp == PBT_POWERSETTINGCHANGE) {
             POWERBROADCAST_SETTING *ps = (POWERBROADCAST_SETTING *)lp;
             if (IsEqualGUID(&ps->PowerSetting, &GUID_CONSOLE_DISPLAY_STATE) && ps->DataLength >= sizeof(DWORD)) {
@@ -1046,6 +1397,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     // Developer modes for the panel (preview, off-screen shot, benchmark): see the end of panel.c.
     if (wcsstr(cmd, L"--panel-")) return panelDev(cmd);
+    if (wcsstr(cmd, L"--devices")) return devicesReport();
     HANDLE mutex = CreateMutexW(NULL, TRUE, L"Local\\BlackoutTray");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
@@ -1080,9 +1432,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     hasRam = GetFileAttributesW(fury) != INVALID_FILE_ATTRIBUTES;
     setFans(-1);
     litOn = getDword(L"RgbOn", 1), litWant = getDword(L"RgbWant", 1), curveOn = getDword(L"FanCurve", 1);
-    fanWhy = fanChCount && curveN ? 3 : 1;
-    hasCurve = fanChCount && curveN && sioInit();
-    if (hasCurve && GetPrivateProfileIntW(L"fans", L"dump", 0, iniPath)) sioDump();
+    hasCurve = outCount && curveN && fansInit();
     // An elevated window drops messages from normal processes unless allowed (tray clicks and remote "screens off").
     ChangeWindowMessageFilterEx(hwnd, WM_COMMAND, MSGFLT_ALLOW, NULL);
     ChangeWindowMessageFilterEx(hwnd, WM_TRAY, MSGFLT_ALLOW, NULL);

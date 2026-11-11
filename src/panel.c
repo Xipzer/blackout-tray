@@ -334,8 +334,9 @@ static BOOL curveEdited(void) {
 
 static LPCWSTR fanWhyText(void) {
     static const LPCWSTR why[] = {L"", L"Not set up: add [fans] to blackout.ini", L"Needs Blackout to run as admin", L"PawnIO or LpcIO.bin is missing",
-                                  L"No supported fan chip found"};
-    return why[fanWhy < 0 || fanWhy > 4 ? 0 : fanWhy];
+                                  L"No known fan chip found: run blackout.exe --devices", L"A fan or sensor in blackout.ini was not found",
+                                  L"Untested hardware: set untested=1 to use it"};
+    return why[fanWhy < 0 || fanWhy > 6 ? 0 : fanWhy];
 }
 
 // ---- Views ----
@@ -415,7 +416,7 @@ static void paintMain(float x, float y, float w) {
     else wsprintfW(s, L"%d.%d", (int)coolant, (int)(coolant * 10 + 0.5) % 10);
     text(s, F_BIG, rc(ix, cy - 4, 120, 40), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     text(L"\x00B0" L"C", F_UNIT, rc(ix + 2 + measure(s, F_BIG), cy + 10, 30, 22), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    text(L"Water", F_SMALL, rc(ix, cy + 38, 80, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    text(srcLabel, F_SMALL, rc(ix, cy + 38, 120, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     if (fanDuty < 0) lstrcpyW(s, L"BIOS");
     else wsprintfW(s, L"%d", fanDuty);
     text(s, F_BIG, rc(ix + 118, cy - 4, 110, 40), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -438,7 +439,7 @@ static void paintMain(float x, float y, float w) {
     cy += 56 + GAP;
     // Coolant graph: fills from the right as history builds; at least a 1 C span so sensor noise stays flat.
     if (coolant < 0) {
-        text(L"No water reading. Fans are on the BIOS curve.", F_SMALL, rc(ix, cy + 15, iw, 18), warn(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+        text(srcDev ? L"No temperature reading. Fans are on the BIOS curve." : L"No water reading. Fans are on the BIOS curve.", F_SMALL, rc(ix, cy + 15, iw, 18), warn(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
     } else if (historyLen >= 8) {
         D2D1_POINT_2F p[HISTORY];
         float top = cy + 4, bot = cy + 44;
@@ -456,7 +457,7 @@ static void paintMain(float x, float y, float w) {
     }
     divider(ix, cy + 48, iw);
     cy += 48 + GAP;
-    int chips = fanChCount < 3 ? fanChCount : 3;
+    int chips = outCount < 3 ? outCount : 3;
     float cw = chips ? (iw - (chips - 1) * 8) / chips : iw;
     for (int i = 0; i < chips; i++) {
         WCHAR name[32];
@@ -472,7 +473,7 @@ static void paintMain(float x, float y, float w) {
     }
     cy += 44 + INSET;
     divider(x, cy, w);
-    toggleRow(L"Follow water temperature", NULL, x, cy, w, H_CURVE, curveOn, TRUE);
+    toggleRow(srcDev ? L"Follow the temperature" : L"Follow water temperature", NULL, x, cy, w, H_CURVE, curveOn, TRUE);
 }
 
 static void paintFans(float x, float y, float w) {
@@ -482,8 +483,8 @@ static void paintFans(float x, float y, float w) {
         card(x, y, w, 118);
         text(L"The fan curve is off", F_ROW, rc(ix, y + 14, iw, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
         text(fanWhyText(), F_SMALL, rc(ix, y + 38, iw, 18), warn(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        text(L"It runs motherboard fans from the water temperature.", F_SMALL, rc(ix, y + 66, iw, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        text(L"Setup: README, section Coolant fan curve.", F_SMALL, rc(ix, y + 86, iw, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        text(L"It sets fan speeds from a water or board temperature.", F_SMALL, rc(ix, y + 66, iw, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        text(L"Setup: README, section Fan curve.", F_SMALL, rc(ix, y + 86, iw, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
         return;
     }
     card(x, y, w, INSET + 6 + CHART_H + 18 + GAP + 18 + INSET + 3 * ROW);
@@ -541,7 +542,7 @@ static void paintFans(float x, float y, float w) {
     cy += ROW;
     divider(x, cy, w);
     wsprintfW(s, L"%d \x00B0" L"C", fanHyst);
-    stepperRow(L"Slow down after", L"Water must be this much cooler first", s, x, cy, w, H_HYS_DN, H_HYS_UP, fanHyst > 0, fanHyst < 5);
+    stepperRow(L"Slow down after", srcDev ? L"It must be this much cooler first" : L"Water must be this much cooler first", s, x, cy, w, H_HYS_DN, H_HYS_UP, fanHyst > 0, fanHyst < 5);
     cy += ROW;
     divider(x, cy, w);
     BOOL edited = curveEdited();
@@ -607,10 +608,10 @@ static void paintSystem(float x, float y, float w) {
     section(L"STATUS", x, &y, w);
     card(x, y, w, 7 * 28 + 8);
     y += 4;
-    if (!fanWhy) wsprintfW(s, L"Active on %d fan header%s", fanChCount, fanChCount == 1 ? L"" : L"s");
+    if (!fanWhy) wsprintfW(s, L"Active on %d fan%s", outCount, outCount == 1 ? L"" : L"s");
     statusRow(L"Fan curve", !fanWhy ? s : fanWhy == 1 ? L"Not set up" : fanWhyText(), fanWhy == 0 ? 2 : fanWhy == 1 ? 0 : 1, x, y, w);
-    if (coolant >= 0) wsprintfW(s, L"%d.%d \x00B0" L"C from the iCUE LINK hub", (int)coolant, (int)(coolant * 10 + 0.5) % 10);
-    statusRow(L"Water sensor", coolant >= 0 ? s : hasCurve ? L"No reading" : L"Not used", coolant >= 0 ? 2 : hasCurve ? 1 : 0, x, y + 28, w);
+    if (coolant >= 0) wsprintfW(s, L"%d.%d \x00B0" L"C from %s", (int)coolant, (int)(coolant * 10 + 0.5) % 10, srcFrom);
+    statusRow(srcDev ? L"Temperature" : L"Water sensor", coolant >= 0 ? s : hasCurve ? L"No reading" : L"Not used", coolant >= 0 ? 2 : hasCurve ? 1 : 0, x, y + 28, w);
     wsprintfW(s, L"Hub connected, %d LEDs", linkLeds);
     statusRow(L"Pump lighting", !linkLeds ? L"Not set up" : linkOk ? s : L"Hub not answering", !linkLeds ? 0 : linkOk ? 2 : 1, x, y + 56, w);
     statusRow(L"OpenRGB", hasOpenRgb ? L"Found" : openrgb[0] ? L"Not found at the path in blackout.ini" : L"Not set up", hasOpenRgb ? 2 : openrgb[0] ? 1 : 0, x,
@@ -618,7 +619,7 @@ static void paintSystem(float x, float y, float w) {
     statusRow(L"RAM lighting", hasRam ? L"FURY module found" : L"Not installed", hasRam ? 2 : 0, x, y + 112, w);
     statusRow(L"Monitor power", ddcIds[0] ? ddcIds : L"Not set up", ddcIds[0] ? 2 : 0, x, y + 140, w);
     BOOL admin = panelTest ? pref(L"Admin", 1) : isElevated();
-    statusRow(L"Admin rights", admin ? L"Yes" : L"No, so the fan curve can't run", admin ? 2 : fanChCount ? 1 : 0, x, y + 168, w);
+    statusRow(L"Admin rights", admin ? L"Yes" : L"No, so the fan curve can't run", admin ? 2 : outCount ? 1 : 0, x, y + 168, w);
     text(L"Blackout " VERSION L"  \x00B7  github.com/Xipzer/blackout-tray", F_TINY, rc(x + 2, SET_H - PAD - 14, w, 14), dim(), 0.8f,
          DWRITE_TEXT_ALIGNMENT_LEADING);
 }
@@ -1232,7 +1233,7 @@ static int panelDev(LPWSTR cmd) {
     hasOpenRgb = openrgb[0] && GetFileAttributesW(openrgb) != INVALID_FILE_ATTRIBUTES;
     hasRam = GetFileAttributesW(fury) != INVALID_FILE_ATTRIBUTES;
     linkOk = TRUE;
-    hasCurve = fanChCount && curveN && !flag(cmd, L"nofans") && !flag(cmd, L"notadmin");
+    hasCurve = outCount && curveN && !flag(cmd, L"nofans") && !flag(cmd, L"notadmin");
     fanWhy = hasCurve ? 0 : flag(cmd, L"notadmin") ? 2 : 1;
     // Every switch is faked, so previews and screenshots never depend on (or change) this machine's settings.
     setPref(L"RgbOn", !flag(cmd, L"rgboff")), setPref(L"Sync", 1), setPref(L"Start", 1), setPref(L"Admin", !flag(cmd, L"notadmin"));
@@ -1248,7 +1249,7 @@ static int panelDev(LPWSTR cmd) {
         }
         historyLen = HISTORY, historyPos = 0;
     }
-    for (int i = 0; i < fanChCount && i < 3; i++) fanRpm[i] = fanDuty < 0 ? 2990 + i * 6 : fanDuty * 34 + i * 17;
+    for (int i = 0; i < outCount && i < 3; i++) fanRpm[i] = fanDuty < 0 ? 2990 + i * 6 : fanDuty * 34 + i * 17;
     if (flag(cmd, L"wakes")) {
         static const LPCWSTR why[3] = {L"Left-click (Hotkey mode)", L"Mouse: PRO X SUPERLIGHT 2c", L"No input seen (Windows or an app)"};
         for (wakeCount = 0; wakeCount < 3; wakeCount++) {
