@@ -8,5 +8,5 @@ python3 tools/make_icon.py build/blackout.ico
 cp src/blackout.rc build/
 "$ZIG" cc -target x86_64-windows-gnu -Os -s -municode -Wl,--subsystem,windows \
   src/blackout.c build/blackout.rc -o build/blackout.exe \
-  -lkernel32 -luser32 -lshell32 -ladvapi32 -lsetupapi -lhid -lpowrprof -ldxva2
+  -lkernel32 -luser32 -lshell32 -ladvapi32 -lsetupapi -lhid -lpowrprof -ldxva2 -ldwmapi -lgdi32
 ls -l build/blackout.exe
