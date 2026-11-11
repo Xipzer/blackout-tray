@@ -559,7 +559,10 @@ static int curveAt(double t) {
 // Fan RPM for the panel only; read while it is open.
 static void fansReadRpm(void) {
     if (!isaLock()) return;
-    for (int i = 0; i < fanChCount; i++) fanRpm[i] = hwmRead(0x4C0 + fanCh[i] * 2) << 8 | hwmRead(0x4C1 + fanCh[i] * 2);
+    for (int i = 0; i < fanChCount; i++) {
+        int reg = fanCh[i] == 6 ? 0x4CE : 0x4C0 + fanCh[i] * 2; // the seventh channel's RPM is at 4CE, not 4CC
+        fanRpm[i] = hwmRead(reg) << 8 | hwmRead(reg + 1);
+    }
     hwmSelect(0);
     ReleaseMutex(isaMutex);
 }

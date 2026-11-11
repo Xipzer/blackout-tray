@@ -51,13 +51,11 @@ def shot(exe, flags, png):
     if os.path.exists(bmp):
         os.remove(bmp)
     subprocess.run([exe, "--panel-shot", *flags.split(), "x2", "out=" + winpath(bmp)], check=False, cwd=os.path.dirname(exe))
-    img = Image.open(bmp).convert("RGB").convert("RGBA")
-    # The real window rounds only the corner that faces the desktop (top-left): 8 px, here at 2x.
-    r = 16
-    mask = Image.new("L", img.size, 255)
-    ImageDraw.Draw(mask).rectangle([0, 0, r, r], fill=0)
-    ImageDraw.Draw(mask).pieslice([0, 0, 2 * r, 2 * r], 180, 270, fill=255)
-    img.putalpha(mask)
+    # 32-bit top-down BMP with premultiplied alpha: the rounded corner is already in the picture.
+    data = open(bmp, "rb").read()
+    width = int.from_bytes(data[18:22], "little", signed=True)
+    height = abs(int.from_bytes(data[22:26], "little", signed=True))
+    img = Image.frombuffer("RGBa", (width, height), data[int.from_bytes(data[10:14], "little"):], "raw", "BGRa", 0, 1).convert("RGBA")
     img.save(png)
     os.remove(bmp)
     return img
