@@ -6,10 +6,8 @@
 // For a 372 px panel that opens in about 15 ms and needs about 15 MB while open, where a GPU target took 90 to 400 ms
 // and 60 to 70 MB because it loads the graphics driver into the process. Measured with --panel-bench.
 //
-// Look: docked flush to the taskbar and the screen edge, square on those sides, one rounded corner facing the desktop.
-// The background is the taskbar's material made by hand: what is on screen behind the panel, blurred, under a neutral
-// dark tint (see panelBackdrop). Windows offers this to its own shell surfaces only; the documented backdrops and the
-// accent-policy acrylic both come out flat on a window like this one.
+// Look: docked flush to the taskbar and the screen edge, square on those sides, one rounded corner facing the desktop,
+// and filled with the taskbar's own colour (sampled when it opens) so it reads as part of the same surface.
 //
 // Views: Main (screens off, lighting, live cooling) and Settings with three tabs (Fans, Wake, System).
 #define COBJMACROS
@@ -57,10 +55,6 @@ static HBITMAP surfBmp;
 static HGDIOBJ surfOld;
 static void *surfBits;
 static int surfW, surfH;
-static DWORD *backPx; // what was behind the panel when it opened, blurred and tinted (opaque BGRA)
-static int backW, backH;
-static ID2D1Bitmap *backBmp;
-static ID2D1BitmapBrush *backBrush;
 static ID2D1RenderTarget *rt;
 static ID2D1SolidColorBrush *brush;
 static IDWriteTextFormat *fmt[F_COUNT];
@@ -106,6 +100,7 @@ static UINT tone(void) { return panelLight ? 0x000000 : 0xFFFFFF; }
 static UINT warn(void) { return panelLight ? 0xB45309 : WARN; }
 static UINT knob(void) { return panelLight ? 0x1B1B1F : 0xFFFFFF; } // markers that sit on the background
 static UINT panelTint; // 0xRRGGBB taken from the taskbar, 0 = none
+static int shade = 85, grey; // percent of the taskbar's brightness, and percent of its colour removed
 static UINT baseColor(void) { return panelTint ? panelTint : panelLight ? 0xEDEDED : 0x1C1E20; }
 
 static void paint(UINT rgb, float a) {
@@ -655,15 +650,8 @@ static void paintPanel(void) {
             ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
             ID2D1GeometrySink_Close(sink);
             ID2D1GeometrySink_Release(sink);
-            if (backBrush) {
-                // The backdrop was captured for the tallest view; line it up with the edge that touches the taskbar.
-                D2D1_MATRIX_3X2_F shift = {{{1, 0, 0, 1, 0, dockTop ? 0 : H - backH / panelScale}}};
-                ID2D1BitmapBrush_SetTransform(backBrush, &shift);
-                ID2D1RenderTarget_FillGeometry(rt, (ID2D1Geometry *)g, (ID2D1Brush *)backBrush, NULL);
-            } else {
-                paint(baseColor(), 1);
-                ID2D1RenderTarget_FillGeometry(rt, (ID2D1Geometry *)g, (ID2D1Brush *)brush, NULL);
-            }
+            paint(baseColor(), 1);
+            ID2D1RenderTarget_FillGeometry(rt, (ID2D1Geometry *)g, (ID2D1Brush *)brush, NULL);
         }
         ID2D1PathGeometry_Release(g);
     }
@@ -705,9 +693,6 @@ static void panelFree(void) {
     for (int i = 0; i < F_COUNT; i++)
         if (fmt[i]) IDWriteTextFormat_Release(fmt[i]), fmt[i] = NULL;
     if (brush) ID2D1SolidColorBrush_Release(brush), brush = NULL;
-    if (backBrush) ID2D1BitmapBrush_Release(backBrush), backBrush = NULL;
-    if (backBmp) ID2D1Bitmap_Release(backBmp), backBmp = NULL;
-    if (backPx) HeapFree(GetProcessHeap(), 0, backPx), backPx = NULL;
     if (dcrt) ID2D1DCRenderTarget_Release(dcrt), dcrt = NULL;
     rt = NULL;
     if (surfDc) {
@@ -747,80 +732,6 @@ static BOOL panelLoad(void) {
     return ok;
 }
 
-// One box blur pass over `lines` lines of `count` pixels. Pixel i of a line is at line * lineStep + i * step.
-static void blurPass(const BYTE *src, BYTE *dst, int count, int lines, int step, int lineStep, int r) {
-    for (int l = 0; l < lines; l++) {
-        const BYTE *s = src + l * lineStep;
-        BYTE *d = dst + l * lineStep;
-        for (int c = 0; c < 3; c++) {
-            int sum = 0;
-            for (int i = -r; i <= r; i++) sum += s[(i < 0 ? 0 : i >= count ? count - 1 : i) * step + c];
-            for (int i = 0; i < count; i++) {
-                int in = i + r + 1, out = i - r;
-                d[i * step + c] = (BYTE)(sum / (2 * r + 1));
-                sum += s[(in >= count ? count - 1 : in) * step + c] - s[(out < 0 ? 0 : out) * step + c];
-            }
-        }
-    }
-}
-
-// The taskbar's look, made by hand: copy what is on screen where the panel will be, blur it (three box passes, close
-// to the 30 px Gaussian of Windows acrylic) and lay a neutral dark tint over it. The tint strength is solved so that
-// the edge touching the taskbar comes out in the taskbar's own colour, so the two read as one surface on any
-// wallpaper. It is a snapshot taken once per opening; the panel is only up for seconds. bar is the taskbar's colour
-// (0x00RRGGBB) or -1. With transparency effects off the taskbar is a flat colour and so is the panel.
-static void panelBackdrop(int x, int y, int w, int h, int bar) {
-    BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB, 0, 0, 0, 0, 0}, {{0}}};
-    int tintTo = panelLight ? 243 : 16, r = (int)(14 * panelScale + 0.5f), n = w * h;
-    panelTint = bar >= 0 ? (UINT)bar : 0;
-    if (!getDwordAt(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"EnableTransparency", 1)) return;
-    DWORD *a = HeapAlloc(GetProcessHeap(), 0, n * 4), *b = HeapAlloc(GetProcessHeap(), 0, n * 4);
-    HDC screen = GetDC(NULL), mem = CreateCompatibleDC(screen);
-    HBITMAP bmp = CreateCompatibleBitmap(screen, w, h);
-    HGDIOBJ old = SelectObject(mem, bmp);
-    BOOL ok = a && b && BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY);
-    SelectObject(mem, old);
-    ok = ok && GetDIBits(mem, bmp, 0, h, a, &bi, DIB_RGB_COLORS) == h;
-    DeleteObject(bmp);
-    DeleteDC(mem);
-    ReleaseDC(NULL, screen);
-    if (ok) {
-        for (int pass = 0; pass < 3; pass++) {
-            blurPass((BYTE *)a, (BYTE *)b, w, h, 4, w * 4, r);
-            blurPass((BYTE *)b, (BYTE *)a, h, w, w * 4, 4, r);
-        }
-        // Brightness of the backdrop along the edge that meets the taskbar, and of the taskbar itself.
-        int edge = (dockTop ? 0 : h - 1) * w, behind = 0, target = bar < 0 ? -1 : ((bar >> 16 & 255) * 3 + (bar >> 8 & 255) * 6 + (bar & 255)) / 10;
-        for (int i = 0; i < w; i++) behind += ((a[edge + i] >> 16 & 255) * 3 + (a[edge + i] >> 8 & 255) * 6 + (a[edge + i] & 255)) / 10;
-        behind /= w;
-        // tinted = behind * (1 - k) + tintTo * k, solved for k (in 1/256), kept within sensible bounds.
-        int k = 102; // 40% when there is nothing to match against
-        if (target >= 0 && behind != tintTo && (behind > tintTo) == (behind > target)) k = (behind - target) * 256 / (behind - tintTo);
-        k = k < 31 ? 31 : k > 205 ? 205 : k;
-        int sum[3] = {0, 0, 0};
-        for (int i = 0; i < n; i++) {
-            DWORD px = a[i], out = 0xFF000000;
-            int v[3], luma;
-            for (int c = 0; c < 3; c++) v[c] = ((px >> (8 * c) & 255) * (256 - k) + tintTo * k) >> 8;
-            // Keep the text readable whatever is behind: a bright window may not lift a dark panel above a dim grey
-            // (and a dark one may not pull a light panel below a pale grey). Windows acrylic does the same with its
-            // luminosity layer.
-            luma = (v[2] * 3 + v[1] * 6 + v[0]) / 10;
-            for (int c = 0; c < 3; c++) {
-                if (!panelLight && luma > 72) v[c] = v[c] * 72 / luma;
-                if (panelLight && luma < 190) v[c] = 255 - (255 - v[c]) * 65 / (255 - luma);
-                out |= (DWORD)v[c] << (8 * c);
-                if (i >= edge && i < edge + w) sum[c] += v[c];
-            }
-            a[i] = out;
-        }
-        panelTint = (UINT)(sum[2] / w) << 16 | (UINT)(sum[1] / w) << 8 | (UINT)(sum[0] / w); // for shapes that need the background colour
-        backPx = a, backW = w, backH = h, a = NULL;
-    }
-    if (a) HeapFree(GetProcessHeap(), 0, a);
-    if (b) HeapFree(GetProcessHeap(), 0, b);
-}
-
 // The bitmap the panel is drawn into, remade when the view changes height.
 static BOOL panelSurface(int w, int h) {
     if (surfDc && w == surfW && h == surfH) return TRUE;
@@ -856,20 +767,12 @@ static BOOL panelRender(POINT *pos) {
         rt = (ID2D1RenderTarget *)dcrt;
         ID2D1RenderTarget_SetTextAntialiasMode(rt, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         if (ID2D1RenderTarget_CreateSolidColorBrush(rt, &white, NULL, &brush) != S_OK) return FALSE;
-        if (backPx) {
-            D2D1_BITMAP_PROPERTIES bp = {{DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED}, 96 * panelScale, 96 * panelScale};
-            D2D1_SIZE_U size = {(UINT32)backW, (UINT32)backH};
-            if (ID2D1RenderTarget_CreateBitmap(rt, size, backPx, backW * 4, &bp, &backBmp) == S_OK)
-                rt->lpVtbl->CreateBitmapBrush(rt, backBmp, NULL, NULL, &backBrush); // the C macro in the header has the wrong arity
-        }
     }
     ID2D1DCRenderTarget_BindDC(dcrt, surfDc, &r);
     ID2D1RenderTarget_BeginDraw(rt);
     paintPanel();
     if (ID2D1RenderTarget_EndDraw(rt, NULL, NULL) != S_OK) {
         ID2D1SolidColorBrush_Release(brush), brush = NULL;
-        if (backBrush) ID2D1BitmapBrush_Release(backBrush), backBrush = NULL;
-        if (backBmp) ID2D1Bitmap_Release(backBmp), backBmp = NULL;
         ID2D1DCRenderTarget_Release(dcrt), dcrt = NULL, rt = NULL;
         return FALSE;
     }
@@ -1178,8 +1081,10 @@ static BOOL panelShow(HWND owner) {
             wa.bottom = bar.top;
         }
     }
-    // The taskbar's colour: one row of its pixels, per-channel median, so icons and highlights don't count.
-    int barColor = -1;
+    // Take the panel's colour from the taskbar it docks to, a shade darker, so it reads as part of the same surface on
+    // any wallpaper, accent colour or transparency setting. One row of taskbar pixels, per-channel median.
+    DWORD tint = 0;
+    panelTint = 0;
     if (docked) {
         int w = bar.right - bar.left > 512 ? 512 : bar.right - bar.left, hist[3][256] = {{0}};
         DWORD row[512];
@@ -1190,14 +1095,20 @@ static BOOL panelShow(HWND owner) {
         BOOL ok = BitBlt(mem, 0, 0, w, 1, screen, bar.right - w, bar.top <= mi.rcMonitor.top ? bar.bottom - 3 : bar.top + 2, SRCCOPY);
         SelectObject(mem, old);
         if (ok && GetDIBits(mem, bmp, 0, 1, row, &bi, DIB_RGB_COLORS)) {
-            barColor = 0;
             for (int i = 0; i < w; i++)
-                for (int c = 0; c < 3; c++) hist[c][(row[i] >> (8 * c)) & 255]++;
+                for (int c = 0; c < 3; c++) hist[c][(row[i] >> (16 - 8 * c)) & 255]++;
+            int med[3], luma;
             for (int c = 0; c < 3; c++) {
-                int seen = 0, v = 0;
-                while (v < 255 && (seen += hist[c][v]) * 2 < w) v++;
-                barColor |= v << (8 * c);
+                int seen = 0;
+                med[c] = 0;
+                while (med[c] < 255 && (seen += hist[c][med[c]]) * 2 < w) med[c]++;
             }
+            luma = (med[0] * 3 + med[1] * 6 + med[2]) / 10;
+            for (int c = 0; c < 3; c++) {
+                int v = (med[c] * (100 - grey) + luma * grey) / 100 * shade / 100;
+                tint |= (DWORD)(v > 255 ? 255 : v) << (8 * c); // AABBGGRR: c = 0 is red
+            }
+            panelTint = (tint & 255) << 16 | (tint & 0xFF00) | (tint >> 16 & 255);
         }
         DeleteObject(bmp);
         DeleteDC(mem);
@@ -1211,8 +1122,6 @@ static BOOL panelShow(HWND owner) {
     int pw = (int)(PANEL_W * panelScale + 0.5f), ph = (int)(panelH * panelScale + 0.5f);
     dockTop = wa.top > mi.rcMonitor.top; // taskbar at the top
     int px = wa.right - pw, py = dockTop ? wa.top : wa.bottom - ph;
-    int tallPx = (int)(tallest * panelScale + 0.5f);
-    panelBackdrop(px, dockTop ? wa.top : wa.bottom - tallPx, pw, tallPx, barColor);
     panel = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | (panelHidden ? WS_EX_NOACTIVATE : 0), PANEL_CLASS, L"Blackout", WS_POPUP,
                             px, py, pw, ph, owner, NULL, GetModuleHandleW(NULL), NULL);
     if (!panel) {
@@ -1240,7 +1149,7 @@ static BOOL panelShow(HWND owner) {
 //   --panel-shot  [flags] out=<file>   draw one view off-screen to a .bmp, no window at all (README images, reviews)
 //   --panel-bench                      open and close five times, never shown; log time and memory to %TEMP%
 // Flags: fans wake system | light | x2 | nofans notadmin noread curveoff atcap nohist | hotkey wakes edited rgboff
-//        hover=<id> drag=<point>
+//        hover=<id> drag=<point> shade=<percent> grey=<percent>
 
 static BOOL flag(LPCWSTR cmd, LPCWSTR name) {
     WCHAR key[32] = L" ";
@@ -1348,6 +1257,8 @@ static int panelDev(LPWSTR cmd) {
             lstrcpyW(wakes[wakeCount].cause, why[wakeCount]);
         }
     }
+    if ((at = wcsstr(cmd, L"shade="))) shade = _wtoi(at + 6); // try other backgrounds without rebuilding
+    if ((at = wcsstr(cmd, L"grey="))) grey = _wtoi(at + 5);
     if ((at = wcsstr(cmd, L"hover="))) hover = _wtoi(at + 6);
     if ((at = wcsstr(cmd, L"drag="))) dragPoint = _wtoi(at + 5);
     tabsBuild();
