@@ -1,10 +1,13 @@
-// Tray panel: a Windows 11 style flyout drawn with Direct2D/DirectWrite over the DWM acrylic backdrop.
+// Tray panel: a Windows 11 style flyout drawn with Direct2D/DirectWrite.
 // Included by blackout.c (one translation unit, shares its state).
 //
 // Cost model: the panel exists only while it is open. d2d1.dll and dwrite.dll are loaded on open and freed on close.
-// Drawing is done on the CPU (software DC render target), not the GPU: for a 372 px panel that opens in ~15 ms and
-// needs ~10 MB while open, where a GPU target took ~160 ms and ~60 MB because it loads the graphics driver into the
-// process. Measured with --panel-bench.
+// Drawing is done on the CPU (software DC render target) into a 32-bit bitmap that is handed to a layered window.
+// For a 372 px panel that opens in about 15 ms and needs about 15 MB while open, where a GPU target took 90 to 400 ms
+// and 60 to 70 MB because it loads the graphics driver into the process. Measured with --panel-bench.
+//
+// Look: docked flush to the taskbar and the screen edge, square on those sides, one rounded corner facing the desktop,
+// and filled with the taskbar's own colour (sampled when it opens) so it reads as part of the same surface.
 //
 // Views: Main (screens off, lighting, live cooling) and Settings with three tabs (Fans, Wake, System).
 #define COBJMACROS
@@ -29,6 +32,7 @@
 #define ACCENT      0xE5484D
 #define WARN        0xF0A35B
 #define GOOD        0x3FB950
+#define WM_RENDER   (WM_APP + 3)
 
 enum {
     H_NONE, H_SCREENS, H_GEAR, H_BACK, H_TAB_FANS, H_TAB_WAKE, H_TAB_SYSTEM, H_RGB, H_SYNC, H_CURVE, H_START, H_EXIT,
@@ -46,7 +50,11 @@ static HMODULE d2dLib, dwLib;
 static ID2D1Factory *d2f;
 static IDWriteFactory *dwf;
 static ID2D1DCRenderTarget *dcrt;
-static ID2D1HwndRenderTarget *hrt; // fallback if a DC target can't be made
+static HDC surfDc; // the panel is drawn into this bitmap, premultiplied BGRA
+static HBITMAP surfBmp;
+static HGDIOBJ surfOld;
+static void *surfBits;
+static int surfW, surfH;
 static ID2D1RenderTarget *rt;
 static ID2D1SolidColorBrush *brush;
 static IDWriteTextFormat *fmt[F_COUNT];
@@ -54,7 +62,7 @@ static HWND panelOwner;
 static float panelScale = 1, panelH;
 static D2D1_RECT_F hit[H_COUNT];
 static int hover, dragPoint = -1, view = V_MAIN, settingsTab = V_FANS, tabs[3], tabCount;
-static BOOL dockTop, panelLight, panelTest, panelOpaque, panelHidden, panelGpu;
+static BOOL dockTop, panelLight, panelTest, panelHidden, dirty;
 static DWORD panelClosedAt;
 static D2D1_RECT_F chart;
 static const float tMin = 25, tMax = 50;
@@ -91,7 +99,8 @@ static UINT dim(void) { return panelLight ? 0x5F5F66 : 0xA8A8AD; }
 static UINT tone(void) { return panelLight ? 0x000000 : 0xFFFFFF; }
 static UINT warn(void) { return panelLight ? 0xB45309 : WARN; }
 static UINT knob(void) { return panelLight ? 0x1B1B1F : 0xFFFFFF; } // markers that sit on the background
-static UINT baseColor(void) { return panelOpaque ? (panelLight ? 0xEDEDED : 0x1C1E20) : panelLight ? 0xF3F3F3 : 0x111416; }
+static UINT panelTint; // 0xRRGGBB taken from the taskbar, 0 = none
+static UINT baseColor(void) { return panelTint ? panelTint : panelLight ? 0xEDEDED : 0x1C1E20; }
 
 static void paint(UINT rgb, float a) {
     D2D1_COLOR_F c = rgba(rgb, a);
@@ -616,14 +625,53 @@ static void paintSystem(float x, float y, float w) {
 static void paintPanel(void) {
     float x = PAD, w = PANEL_W - 2 * PAD, y = PAD;
     D2D1_COLOR_F clear = {0, 0, 0, 0};
-    D2D1_RECT_F all = rc(0, 0, PANEL_W, panelH);
+    ID2D1PathGeometry *g;
+    ID2D1GeometrySink *sink;
+    float r = RADIUS, W = PANEL_W, H = panelH;
     ID2D1RenderTarget_Clear(rt, &clear);
-    // Square tint over the acrylic backdrop, matched to the dark taskbar. The window region rounds the one free corner.
-    paint(baseColor(), panelOpaque ? 1 : panelLight ? 0.72f : 0.82f);
-    ID2D1RenderTarget_FillRectangle(rt, &all, (ID2D1Brush *)brush);
-    // Hairline on the two free edges, like the taskbar's own edge.
-    line(0, dockTop ? panelH - 0.5f : 0.5f, PANEL_W, dockTop ? panelH - 0.5f : 0.5f, tone(), panelLight ? 0.10f : 0.08f, 1);
-    line(0.5f, 0, 0.5f, panelH, tone(), panelLight ? 0.10f : 0.08f, 1);
+    // Background: one opaque shape, square where it meets the taskbar and the screen edge, rounded at the corner that
+    // faces the desktop. The window is layered, so the curve is anti-aliased against whatever is behind it.
+    if (ID2D1Factory_CreatePathGeometry(d2f, &g) == S_OK) {
+        if (ID2D1PathGeometry_Open(g, &sink) == S_OK) {
+            D2D1_ARC_SEGMENT corner = {{dockTop ? 0 : r, dockTop ? H - r : 0}, {r, r}, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL};
+            if (dockTop) {
+                ID2D1GeometrySink_BeginFigure(sink, pt(0, 0), D2D1_FIGURE_BEGIN_FILLED);
+                ID2D1GeometrySink_AddLine(sink, pt(W, 0));
+                ID2D1GeometrySink_AddLine(sink, pt(W, H));
+                ID2D1GeometrySink_AddLine(sink, pt(r, H));
+            } else {
+                ID2D1GeometrySink_BeginFigure(sink, pt(W, 0), D2D1_FIGURE_BEGIN_FILLED);
+                ID2D1GeometrySink_AddLine(sink, pt(W, H));
+                ID2D1GeometrySink_AddLine(sink, pt(0, H));
+                ID2D1GeometrySink_AddLine(sink, pt(0, r));
+            }
+            ID2D1GeometrySink_AddArc(sink, &corner);
+            ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_CLOSED);
+            ID2D1GeometrySink_Close(sink);
+            ID2D1GeometrySink_Release(sink);
+            paint(baseColor(), 1);
+            ID2D1RenderTarget_FillGeometry(rt, (ID2D1Geometry *)g, (ID2D1Brush *)brush, NULL);
+        }
+        ID2D1PathGeometry_Release(g);
+    }
+    // Hairline along the two free edges and round the corner, like the taskbar's own edge.
+    if (ID2D1Factory_CreatePathGeometry(d2f, &g) == S_OK) {
+        if (ID2D1PathGeometry_Open(g, &sink) == S_OK) {
+            float edge = dockTop ? H - 0.5f : 0.5f;
+            D2D1_ARC_SEGMENT corner = {{0.5f, dockTop ? H - r : r}, {r - 0.5f, r - 0.5f}, 0,
+                                       dockTop ? D2D1_SWEEP_DIRECTION_CLOCKWISE : D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL};
+            ID2D1GeometrySink_BeginFigure(sink, pt(W, edge), D2D1_FIGURE_BEGIN_HOLLOW);
+            ID2D1GeometrySink_AddLine(sink, pt(r, edge));
+            ID2D1GeometrySink_AddArc(sink, &corner);
+            ID2D1GeometrySink_AddLine(sink, pt(0.5f, dockTop ? 0 : H));
+            ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
+            ID2D1GeometrySink_Close(sink);
+            ID2D1GeometrySink_Release(sink);
+            paint(tone(), panelLight ? 0.14f : 0.12f);
+            ID2D1RenderTarget_DrawGeometry(rt, (ID2D1Geometry *)g, (ID2D1Brush *)brush, 1, NULL);
+        }
+        ID2D1PathGeometry_Release(g);
+    }
     memset(hit, 0, sizeof(hit));
     paintHeader(x, y, w);
     y += 32;
@@ -645,8 +693,13 @@ static void panelFree(void) {
         if (fmt[i]) IDWriteTextFormat_Release(fmt[i]), fmt[i] = NULL;
     if (brush) ID2D1SolidColorBrush_Release(brush), brush = NULL;
     if (dcrt) ID2D1DCRenderTarget_Release(dcrt), dcrt = NULL;
-    if (hrt) ID2D1HwndRenderTarget_Release(hrt), hrt = NULL;
     rt = NULL;
+    if (surfDc) {
+        SelectObject(surfDc, surfOld);
+        DeleteObject(surfBmp);
+        DeleteDC(surfDc);
+        surfDc = NULL, surfBmp = NULL, surfBits = NULL, surfW = surfH = 0;
+    }
     if (dwf) IDWriteFactory_Release(dwf), dwf = NULL;
     if (d2f) ID2D1Factory_Release(d2f), d2f = NULL;
     if (dwLib) FreeLibrary(dwLib), dwLib = NULL;
@@ -678,55 +731,63 @@ static BOOL panelLoad(void) {
     return ok;
 }
 
-// CPU (software) DC target by default; see the cost model at the top. hwnd is NULL for an off-screen shot.
-static BOOL panelTarget(HWND hwnd) {
-    D2D1_RENDER_TARGET_PROPERTIES p = {panelGpu ? D2D1_RENDER_TARGET_TYPE_DEFAULT : D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-                                       {DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED},
-                                       96 * panelScale, 96 * panelScale, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT};
-    D2D1_COLOR_F white = {1, 1, 1, 1};
-    if (rt) return TRUE;
-    if (!panelGpu && ID2D1Factory_CreateDCRenderTarget(d2f, &p, &dcrt) == S_OK) {
-        rt = (ID2D1RenderTarget *)dcrt;
-    } else if (hwnd) {
-        RECT r;
-        GetClientRect(hwnd, &r);
-        D2D1_HWND_RENDER_TARGET_PROPERTIES hp = {hwnd, {(UINT32)r.right, (UINT32)r.bottom}, D2D1_PRESENT_OPTIONS_NONE};
-        p.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
-        if (ID2D1Factory_CreateHwndRenderTarget(d2f, &p, &hp, &hrt) != S_OK) return FALSE;
-        rt = (ID2D1RenderTarget *)hrt;
-    } else {
+// The bitmap the panel is drawn into, remade when the view changes height.
+static BOOL panelSurface(int w, int h) {
+    if (surfDc && w == surfW && h == surfH) return TRUE;
+    if (surfDc) {
+        SelectObject(surfDc, surfOld);
+        DeleteObject(surfBmp);
+        DeleteDC(surfDc);
+        surfDc = NULL;
+    }
+    BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB, (DWORD)(w * h * 4), 0, 0, 0, 0}, {{0}}};
+    surfDc = CreateCompatibleDC(NULL);
+    surfBmp = surfDc ? CreateDIBSection(surfDc, &bi, DIB_RGB_COLORS, &surfBits, NULL, 0) : NULL;
+    if (!surfBmp) {
+        if (surfDc) DeleteDC(surfDc);
+        surfDc = NULL;
         return FALSE;
     }
-    ID2D1RenderTarget_SetTextAntialiasMode(rt, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    return ID2D1RenderTarget_CreateSolidColorBrush(rt, &white, NULL, &brush) == S_OK;
+    surfOld = SelectObject(surfDc, surfBmp);
+    surfW = w, surfH = h;
+    return TRUE;
 }
 
-static void panelDraw(HDC dc, int w, int h) {
+// Draws the current view on the CPU and, when there is a window, hands the bitmap to it. pos moves the window too.
+static BOOL panelRender(POINT *pos) {
+    D2D1_RENDER_TARGET_PROPERTIES p = {D2D1_RENDER_TARGET_TYPE_SOFTWARE, {DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED},
+                                       96 * panelScale, 96 * panelScale, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT};
+    D2D1_COLOR_F white = {1, 1, 1, 1};
+    int w = (int)(PANEL_W * panelScale + 0.5f), h = (int)(panelH * panelScale + 0.5f);
     RECT r = {0, 0, w, h};
-    if (dcrt) ID2D1DCRenderTarget_BindDC(dcrt, dc, &r);
+    if (!panelSurface(w, h)) return FALSE;
+    if (!rt) {
+        if (ID2D1Factory_CreateDCRenderTarget(d2f, &p, &dcrt) != S_OK) return FALSE;
+        rt = (ID2D1RenderTarget *)dcrt;
+        ID2D1RenderTarget_SetTextAntialiasMode(rt, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        if (ID2D1RenderTarget_CreateSolidColorBrush(rt, &white, NULL, &brush) != S_OK) return FALSE;
+    }
+    ID2D1DCRenderTarget_BindDC(dcrt, surfDc, &r);
     ID2D1RenderTarget_BeginDraw(rt);
     paintPanel();
-    if (ID2D1RenderTarget_EndDraw(rt, NULL, NULL) == D2DERR_RECREATE_TARGET) {
-        if (brush) ID2D1SolidColorBrush_Release(brush), brush = NULL;
-        if (dcrt) ID2D1DCRenderTarget_Release(dcrt), dcrt = NULL;
-        if (hrt) ID2D1HwndRenderTarget_Release(hrt), hrt = NULL;
-        rt = NULL;
+    if (ID2D1RenderTarget_EndDraw(rt, NULL, NULL) != S_OK) {
+        ID2D1SolidColorBrush_Release(brush), brush = NULL;
+        ID2D1DCRenderTarget_Release(dcrt), dcrt = NULL, rt = NULL;
+        return FALSE;
     }
+    if (panel) {
+        POINT src = {0, 0};
+        SIZE size = {w, h};
+        BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        GdiFlush();
+        UpdateLayeredWindow(panel, NULL, pos, &size, surfDc, &src, 0, &blend, ULW_ALPHA);
+    }
+    return TRUE;
 }
 
-static void panelRender(HWND hwnd) {
-    RECT r;
-    if (!panelTarget(hwnd)) return;
-    GetClientRect(hwnd, &r);
-    if (hrt) {
-        D2D1_SIZE_U size = {(UINT32)r.right, (UINT32)r.bottom};
-        ID2D1HwndRenderTarget_Resize(hrt, &size);
-        panelDraw(NULL, r.right, r.bottom);
-        return;
-    }
-    HDC dc = GetDC(hwnd);
-    panelDraw(dc, r.right, r.bottom);
-    ReleaseDC(hwnd, dc);
+// Ask for a redraw. Several requests before the next message collapse into one frame.
+static void panelDirty(void) {
+    if (panel && !dirty) dirty = TRUE, PostMessageW(panel, WM_RENDER, 0, 0);
 }
 
 // ---- Interaction ----
@@ -786,31 +847,15 @@ static void curveRemove(LPARAM lp) {
     saveCurve();
 }
 
-// Docked like the system tray flyouts: flush with the taskbar and the right screen edge, square on those sides,
-// one rounded corner facing the desktop (top-left with a bottom taskbar, bottom-left with a top taskbar).
-static void panelShape(int w, int h) {
-    int d = (int)(2 * RADIUS * panelScale + 0.5f);
-    HRGN shape = CreateRectRgn(0, 0, w, h);
-    HRGN round = dockTop ? CreateRoundRectRgn(0, -d, w + d, h + 1, d, d) : CreateRoundRectRgn(0, 0, w + d, h + d, d, d);
-    CombineRgn(shape, shape, round, RGN_AND);
-    DeleteObject(round);
-    SetWindowRgn(panel, shape, TRUE); // the window owns the region now
-}
-
 // Switch view. The window only changes size between Main and Settings, and only when their heights differ.
 static void panelGo(int to) {
     RECT r;
     view = to, hover = H_NONE;
     if (to != V_MAIN) settingsTab = to;
     GetWindowRect(panel, &r);
-    int ph = (int)(viewHeight() * panelScale + 0.5f), w = r.right - r.left;
     panelH = viewHeight();
-    if (ph != r.bottom - r.top) {
-        panelShape(w, ph);
-        SetWindowPos(panel, NULL, r.left, dockTop ? r.top : r.bottom - ph, w, ph, SWP_NOZORDER | SWP_NOACTIVATE);
-    }
-    panelRender(panel);
-    ValidateRect(panel, NULL);
+    POINT pos = {r.left, dockTop ? r.top : r.bottom - (int)(panelH * panelScale + 0.5f)};
+    panelRender(&pos);
 }
 
 static void panelClick(int id) {
@@ -885,18 +930,21 @@ static void panelClick(int id) {
         if (!panelTest) DestroyWindow(panelOwner);
         return;
     }
-    InvalidateRect(panel, NULL, FALSE);
+    panelDirty();
 }
 
 static LRESULT CALLBACK panelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
-        BeginPaint(hwnd, &ps);
+        BeginPaint(hwnd, &ps); // a layered window keeps its own picture; nothing to draw here
         EndPaint(hwnd, &ps);
-        panelRender(hwnd);
         return 0;
     }
+    case WM_RENDER:
+        dirty = FALSE;
+        panelRender(NULL);
+        return 0;
     case WM_ERASEBKGND: return 1;
     case WM_NCCALCSIZE: if (wp) return 0; break;
     case WM_NCHITTEST: return HTCLIENT;
@@ -910,30 +958,30 @@ static LRESULT CALLBACK panelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             d = d < 20 ? 20 : d > fanMax ? fanMax : d;
             if (t != curveT[dragPoint] || d != curveD[dragPoint]) {
                 curveT[dragPoint] = t, curveD[dragPoint] = d;
-                InvalidateRect(hwnd, NULL, FALSE);
+                panelDirty();
             }
             return 0;
         }
         int h = hitTest(lp);
-        if (h != hover) hover = h, InvalidateRect(hwnd, NULL, FALSE);
+        if (h != hover) hover = h, panelDirty();
         SetCursor(LoadCursorW(NULL, h ? IDC_HAND : curvePointAt(lp) >= 0 ? IDC_SIZEALL : IDC_ARROW));
         TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
         TrackMouseEvent(&tme);
         return 0;
     }
     case WM_MOUSELEAVE:
-        if (hover) hover = H_NONE, InvalidateRect(hwnd, NULL, FALSE);
+        if (hover) hover = H_NONE, panelDirty();
         return 0;
     case WM_LBUTTONDOWN:
         dragPoint = curvePointAt(lp);
-        if (dragPoint >= 0) SetCapture(hwnd), InvalidateRect(hwnd, NULL, FALSE);
+        if (dragPoint >= 0) SetCapture(hwnd), panelDirty();
         return 0;
     case WM_LBUTTONUP:
         if (dragPoint >= 0) {
             dragPoint = -1;
             ReleaseCapture();
             saveCurve();
-            InvalidateRect(hwnd, NULL, FALSE);
+            panelDirty();
         } else {
             panelClick(hitTest(lp));
         }
@@ -941,11 +989,11 @@ static LRESULT CALLBACK panelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDBLCLK:
         // The second click of a fast double click on a switch or button counts as a click too.
         if (hitTest(lp)) panelClick(hitTest(lp));
-        else curveAdd(lp), InvalidateRect(hwnd, NULL, FALSE);
+        else curveAdd(lp), panelDirty();
         return 0;
     case WM_RBUTTONUP:
         curveRemove(lp);
-        InvalidateRect(hwnd, NULL, FALSE);
+        panelDirty();
         return 0;
     case WM_SETCURSOR: return TRUE;
     case WM_KEYDOWN:
@@ -962,7 +1010,7 @@ static LRESULT CALLBACK panelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         panelFree();
         panel = NULL;
-        hover = H_NONE, dragPoint = -1, view = V_MAIN;
+        hover = H_NONE, dragPoint = -1, view = V_MAIN, dirty = FALSE;
         panelClosedAt = GetTickCount();
         if (panelTest && !panelHidden) PostQuitMessage(0);
         trim();
@@ -971,9 +1019,7 @@ static LRESULT CALLBACK panelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static void panelUpdate(void) {
-    if (panel) InvalidateRect(panel, NULL, FALSE);
-}
+static void panelUpdate(void) { panelDirty(); }
 
 // Opens the panel docked to the taskbar. Returns FALSE (caller falls back to the plain menu) if Direct2D is unavailable.
 static BOOL panelShow(HWND owner) {
@@ -1002,8 +1048,10 @@ static BOOL panelShow(HWND owner) {
     NOTIFYICONIDENTIFIER id = {sizeof(id), nid.hWnd, nid.uID, {0}};
     RECT icon;
     POINT anchor;
-    if (panelTest || Shell_NotifyIconGetRect(&id, &icon) != S_OK) GetCursorPos(&anchor);
-    else anchor.x = (icon.left + icon.right) / 2, anchor.y = icon.top;
+    HWND shell = FindWindowW(L"Shell_TrayWnd", NULL);
+    if (!panelTest && Shell_NotifyIconGetRect(&id, &icon) == S_OK) anchor.x = (icon.left + icon.right) / 2, anchor.y = icon.top;
+    else if (shell && GetWindowRect(shell, &icon)) anchor.x = icon.right - 1, anchor.y = icon.top; // the main taskbar
+    else GetCursorPos(&anchor);
     HMONITOR mon = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = {sizeof(mi)};
     GetMonitorInfoW(mon, &mi);
@@ -1013,7 +1061,53 @@ static BOOL panelShow(HWND owner) {
     GetDpi getDpi = shcore ? (GetDpi)GetProcAddress(shcore, "GetDpiForMonitor") : NULL;
     if (getDpi) getDpi(mon, 0, &dpiX, &dpiY);
     if (shcore) FreeLibrary(shcore);
-    RECT wa = mi.rcWork;
+    // Dock against the taskbar's own rectangle on this monitor. The work area is not used unless there is no taskbar
+    // here: Windows sometimes reports it as the whole screen after a display change, which put the panel over the taskbar.
+    RECT wa = mi.rcWork, bar;
+    HWND tray = FindWindowW(L"Shell_TrayWnd", NULL), next = NULL;
+    if (tray && MonitorFromWindow(tray, MONITOR_DEFAULTTONULL) != mon) tray = NULL;
+    while (!tray && (next = FindWindowExW(NULL, next, L"Shell_SecondaryTrayWnd", NULL)))
+        if (MonitorFromWindow(next, MONITOR_DEFAULTTONULL) == mon) tray = next;
+    BOOL docked = tray && IsWindowVisible(tray) && GetWindowRect(tray, &bar);
+    if (docked) {
+        wa = mi.rcMonitor;
+        if (bar.right - bar.left < bar.bottom - bar.top) { // vertical taskbar (Windows 10)
+            if (bar.left <= wa.left) wa.left = bar.right;
+            else wa.right = bar.left;
+        } else if (bar.top <= wa.top) {
+            wa.top = bar.bottom;
+        } else {
+            wa.bottom = bar.top;
+        }
+    }
+    // Take the panel's colour from the taskbar it docks to, lifted a little, so it reads as part of the same surface on
+    // any wallpaper, accent colour or transparency setting. One row of taskbar pixels, per-channel median.
+    DWORD tint = 0;
+    panelTint = 0;
+    if (docked) {
+        int w = bar.right - bar.left > 512 ? 512 : bar.right - bar.left, hist[3][256] = {{0}};
+        DWORD row[512];
+        BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), w, -1, 1, 32, BI_RGB, 0, 0, 0, 0, 0}, {{0}}};
+        HDC screen = GetDC(NULL), mem = CreateCompatibleDC(screen);
+        HBITMAP bmp = CreateCompatibleBitmap(screen, w, 1);
+        HGDIOBJ old = SelectObject(mem, bmp);
+        BOOL ok = BitBlt(mem, 0, 0, w, 1, screen, bar.right - w, bar.top <= mi.rcMonitor.top ? bar.bottom - 3 : bar.top + 2, SRCCOPY);
+        SelectObject(mem, old);
+        if (ok && GetDIBits(mem, bmp, 0, 1, row, &bi, DIB_RGB_COLORS)) {
+            for (int i = 0; i < w; i++)
+                for (int c = 0; c < 3; c++) hist[c][(row[i] >> (16 - 8 * c)) & 255]++;
+            for (int c = 0; c < 3; c++) {
+                int seen = 0, v = 0;
+                while (v < 255 && (seen += hist[c][v]) * 2 < w) v++;
+                v = v * 122 / 100 + 2; // the lift: tray flyouts sit a shade above the taskbar
+                tint |= (DWORD)(v > 255 ? 255 : v) << (8 * c); // AABBGGRR: c = 0 is red
+            }
+            panelTint = (tint & 255) << 16 | (tint & 0xFF00) | (tint >> 16 & 255);
+        }
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(NULL, screen);
+    }
     panelScale = dpiX / 96.0f;
     // Small or heavily scaled screens: shrink the whole panel so the tallest view still fits.
     float tallest = mainHeight() > SET_H ? mainHeight() : SET_H;
@@ -1022,35 +1116,24 @@ static BOOL panelShow(HWND owner) {
     int pw = (int)(PANEL_W * panelScale + 0.5f), ph = (int)(panelH * panelScale + 0.5f);
     dockTop = wa.top > mi.rcMonitor.top; // taskbar at the top
     int px = wa.right - pw, py = dockTop ? wa.top : wa.bottom - ph;
-    panel = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | (panelHidden ? WS_EX_NOACTIVATE : 0), PANEL_CLASS, L"Blackout", WS_POPUP, px, py, pw, ph, owner,
-                            NULL, GetModuleHandleW(NULL), NULL);
+    panel = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | (panelHidden ? WS_EX_NOACTIVATE : 0), PANEL_CLASS, L"Blackout", WS_POPUP,
+                            px, py, pw, ph, owner, NULL, GetModuleHandleW(NULL), NULL);
     if (!panel) {
         panelFree();
         return FALSE;
     }
-    // Acrylic backdrop and dark frame (Windows 11 22H2+; ignored on older builds). No DWM rounding, border or
-    // show/hide animation: the panel appears and disappears instantly, like other tray menus.
-    BOOL dark = !panelLight, cloak = TRUE, noAnim = TRUE;
-    int corner = 1, backdrop = 3;
-    COLORREF border = 0xFFFFFFFE;
-    MARGINS m = {-1, -1, -1, -1};
+    // No DWM show or hide animation: the panel appears and disappears instantly, like other tray menus.
+    BOOL noAnim = TRUE;
     DwmSetWindowAttribute(panel, 3, &noAnim, sizeof(noAnim));
-    DwmSetWindowAttribute(panel, 20, &dark, sizeof(dark));
-    DwmSetWindowAttribute(panel, 33, &corner, sizeof(corner));
-    DwmSetWindowAttribute(panel, 34, &border, sizeof(border));
-    if (!panelOpaque) DwmSetWindowAttribute(panel, 38, &backdrop, sizeof(backdrop));
-    DwmExtendFrameIntoClientArea(panel, &m);
-    panelShape(pw, ph);
     if (hasCurve && !panelTest) fansReadRpm();
-    // Cloaked until the first frame is drawn, so DWM never shows an empty window.
-    DwmSetWindowAttribute(panel, 13, &cloak, sizeof(cloak));
-    SetWindowPos(panel, HWND_TOPMOST, px, py, pw, ph, SWP_FRAMECHANGED | SWP_SHOWWINDOW | (panelHidden ? SWP_NOACTIVATE : 0));
-    panelRender(panel);
-    ValidateRect(panel, NULL);
-    if (panelHidden) return TRUE; // benchmark: stays cloaked, never visible, never focused
-    DwmFlush();
-    cloak = FALSE;
-    DwmSetWindowAttribute(panel, 13, &cloak, sizeof(cloak));
+    // The first frame is in place before the window is shown, so nothing half-drawn is ever visible.
+    POINT pos = {px, py};
+    if (!panelRender(&pos)) {
+        DestroyWindow(panel);
+        return FALSE;
+    }
+    if (panelHidden) return TRUE; // benchmark: never shown
+    ShowWindow(panel, SW_SHOW);
     SetForegroundWindow(panel);
     return TRUE;
 }
@@ -1058,7 +1141,7 @@ static BOOL panelShow(HWND owner) {
 // ---- Developer modes (no hardware access, no single-instance lock) ----
 //   --panel-test  [flags]              open the panel with preview data; exits on close
 //   --panel-shot  [flags] out=<file>   draw one view off-screen to a .bmp, no window at all (README images, reviews)
-//   --panel-bench [gpu]                open and close five times, never visible; log time and memory to %TEMP%
+//   --panel-bench                      open and close five times, never shown; log time and memory to %TEMP%
 // Flags: fans wake system | light | x2 | nofans notadmin noread curveoff atcap nohist | hotkey wakes edited rgboff
 //        hover=<id> drag=<point>
 
@@ -1070,32 +1153,23 @@ static BOOL flag(LPCWSTR cmd, LPCWSTR name) {
 }
 
 static BOOL panelShot(LPCWSTR path) {
+    DWORD wrote;
     if (!panelLoad()) return FALSE;
     panelH = viewHeight();
-    int w = (int)(PANEL_W * panelScale + 0.5f), h = (int)(panelH * panelScale + 0.5f);
-    BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB, (DWORD)(w * h * 4), 0, 0, 0, 0}, {{0}}};
-    BITMAPFILEHEADER head = {0x4D42, sizeof(head) + sizeof(bi.bmiHeader) + w * h * 4, 0, 0, sizeof(head) + sizeof(bi.bmiHeader)};
-    void *bits = NULL;
-    DWORD wrote;
-    HDC dc = CreateCompatibleDC(NULL);
-    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    HGDIOBJ old = SelectObject(dc, bmp);
-    BOOL ok = bits && panelTarget(NULL);
+    BOOL ok = panelRender(NULL);
     if (ok) {
-        panelDraw(dc, w, h);
-        GdiFlush();
+        BITMAPINFOHEADER info = {sizeof(info), surfW, -surfH, 1, 32, BI_RGB, (DWORD)(surfW * surfH * 4), 0, 0, 0, 0};
+        BITMAPFILEHEADER head = {0x4D42, sizeof(head) + sizeof(info) + surfW * surfH * 4, 0, 0, sizeof(head) + sizeof(info)};
         HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
         ok = f != INVALID_HANDLE_VALUE;
         if (ok) {
+            GdiFlush();
             WriteFile(f, &head, sizeof(head), &wrote, NULL);
-            WriteFile(f, &bi.bmiHeader, sizeof(bi.bmiHeader), &wrote, NULL);
-            WriteFile(f, bits, w * h * 4, &wrote, NULL);
+            WriteFile(f, &info, sizeof(info), &wrote, NULL);
+            WriteFile(f, surfBits, surfW * surfH * 4, &wrote, NULL);
             CloseHandle(f);
         }
     }
-    SelectObject(dc, old);
-    DeleteObject(bmp);
-    DeleteDC(dc);
     panelFree();
     return ok;
 }
@@ -1147,9 +1221,7 @@ static int panelDev(LPWSTR cmd) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     loadConfig();
     panelTest = TRUE;
-    panelGpu = flag(cmd, L"gpu");
     panelLight = flag(cmd, L"light");
-    panelOpaque = flag(cmd, L"opaque") || wcsstr(cmd, L"--panel-shot");
     exeDir(fury, L"furyled.exe");
     hasOpenRgb = openrgb[0] && GetFileAttributesW(openrgb) != INVALID_FILE_ATTRIBUTES;
     hasRam = GetFileAttributesW(fury) != INVALID_FILE_ATTRIBUTES;

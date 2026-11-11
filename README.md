@@ -14,7 +14,7 @@ A tiny Windows tray app. Click it and every screen turns off. Lighting, fans, mo
 This works for a Blackout click and for Windows' own display timeout.
 
 **Left-click** the icon: screens off.
-**Right-click**: the Blackout panel, docked to the taskbar and the right screen edge like the system tray menus.
+**Right-click**: the Blackout panel. It sits flush against the taskbar and the screen edge like the system tray menus, and takes its colour from your taskbar.
 
 <p>
 <img src="docs/panel-main.png" width="280" alt="Blackout panel">
