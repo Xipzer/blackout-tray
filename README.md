@@ -14,7 +14,7 @@ A tiny Windows tray app. Click it and every screen turns off. Lighting, fans, mo
 This works for a Blackout click and for Windows' own display timeout.
 
 **Left-click** the icon: screens off.
-**Right-click**: the Blackout panel. It sits flush against the taskbar and the screen edge like the system tray menus, with the same look as the taskbar: a blurred view of what is behind it under a dark tint.
+**Right-click**: the Blackout panel. It sits flush against the taskbar and the screen edge like the system tray menus, and takes its colour from your taskbar.
 
 <p>
 <img src="docs/panel-main.png" width="280" alt="Blackout panel">
@@ -107,7 +107,7 @@ Measured on Windows 11.
 | `blackout.exe` | Always | 0.2 to 0.4 MB | 0% idle |
 | iCUE LINK keep-alive | Every 4 s, only with `[link]` | 5 small USB transfers | ~0% |
 | Coolant fan curve | Same 4 s tick, only with `[fans]` | 4 USB transfers; fan write only when duty changes | ~0% |
-| Panel | Only while open | Opens in about 20 ms, about 18 MB while open, drawn on the CPU so no graphics driver is loaded | Brief |
+| Panel | Only while open | Opens in about 15 ms, about 15 MB while open, drawn on the CPU so no graphics driver is loaded | Brief |
 | `OpenRGB.exe` | 3 to 5 s per change, then exits | ~100 MB while running | Brief |
 | `furyled.exe` | Under 1 s per change | ~10 MB while running | Brief |
 | Kingston FURY CTRL service | Always, if installed | ~40 MB | Kingston's |
