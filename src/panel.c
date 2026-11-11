@@ -100,7 +100,7 @@ static UINT tone(void) { return panelLight ? 0x000000 : 0xFFFFFF; }
 static UINT warn(void) { return panelLight ? 0xB45309 : WARN; }
 static UINT knob(void) { return panelLight ? 0x1B1B1F : 0xFFFFFF; } // markers that sit on the background
 static UINT panelTint; // 0xRRGGBB taken from the taskbar, 0 = none
-static int shade = 85, grey; // percent of the taskbar's brightness, and percent of its colour removed
+static int shade = 100, grey; // percent of the taskbar's brightness, and percent of its colour removed
 static UINT baseColor(void) { return panelTint ? panelTint : panelLight ? 0xEDEDED : 0x1C1E20; }
 
 static void paint(UINT rgb, float a) {
@@ -1081,7 +1081,7 @@ static BOOL panelShow(HWND owner) {
             wa.bottom = bar.top;
         }
     }
-    // Take the panel's colour from the taskbar it docks to, a shade darker, so it reads as part of the same surface on
+    // Take the panel's colour from the taskbar it docks to, unchanged, so it reads as part of the same surface on
     // any wallpaper, accent colour or transparency setting. One row of taskbar pixels, per-channel median.
     DWORD tint = 0;
     panelTint = 0;
