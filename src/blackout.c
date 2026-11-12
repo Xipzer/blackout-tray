@@ -28,6 +28,7 @@
 #define TIMER_LINK   3
 #define TIMER_LAYOUT 4
 #define TIMER_IDLE   5
+#define TIMER_ICON   6
 #define MAX_LINK_LEDS 160
 #define MAX_WINDOWS  256
 #define MAX_CURVE    8
@@ -1267,6 +1268,12 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TIMER:
         KillTimer(hwnd, wp);
+        if (wp == TIMER_ICON) {
+            static int tries;
+            if (Shell_NotifyIconW(NIM_ADD, &nid)) Shell_NotifyIconW(NIM_SETVERSION, &nid);
+            else if (++tries < 30) SetTimer(hwnd, TIMER_ICON, 2000, NULL);
+            return 0;
+        }
         if (wp == TIMER_LINK) {
             // Back off if the hub isn't answering so a missing device can't keep stalling the message loop. The fan
             // curve keeps the 4 s tick, since its 20 s no-reading rule hands the fans back to the BIOS.
@@ -1421,8 +1428,10 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     int px = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem());
     nid.hIcon = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, px, px, 0);
     lstrcpyW(nid.szTip, L"Blackout: click for screens off, right-click for the panel");
-    Shell_NotifyIconW(NIM_ADD, &nid);
-    Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    // Started at logon, Blackout can be faster than the taskbar: then the icon is refused, and the taskbar's
+    // "created" broadcast may already have gone. Try again every 2 s for a minute.
+    if (!Shell_NotifyIconW(NIM_ADD, &nid)) SetTimer(hwnd, TIMER_ICON, 2000, NULL);
+    else Shell_NotifyIconW(NIM_SETVERSION, &nid);
 
     // Registering sends the current display state straight away, which also re-asserts the lighting at login.
     WCHAR fury[MAX_PATH];
