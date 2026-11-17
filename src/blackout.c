@@ -363,6 +363,12 @@ static BOOL hidIo(HANDLE h, const BYTE *out, DWORD outLen, BYTE *in, DWORD inLen
 
 static BOOL linkIo(BYTE *out, BYTE *in) { return hidIo(link, out, 513, in, 513); }
 
+// Windows gives every open handle a copy of each input report. When another program (HWiNFO, iCUE) talks to the hub,
+// its replies queue up on our handle too, and every later read would take a stale reply and stay out of step. So each
+// session starts with an empty queue, and a reply that is not the one asked for drops the handle (a new one starts
+// in step).
+static void linkSync(void) { HidD_FlushQueue(link); }
+
 static BOOL linkCmd(const BYTE *cmd, int cmdLen, const BYTE *data, int dataLen) {
     BYTE out[513] = {0}, in[513];
     out[2] = 1;
@@ -378,6 +384,7 @@ static BOOL linkColor(BYTE r, BYTE g, BYTE b) {
     int len = linkLeds * 3 + 2;
     if (link == INVALID_HANDLE_VALUE) link = openHid(L"vid_1b1c&pid_0c3f", L"mi_00", FILE_FLAG_OVERLAPPED);
     if (link == INVALID_HANDLE_VALUE) return FALSE;
+    linkSync();
     frame[0] = (BYTE)len, frame[1] = (BYTE)(len >> 8), frame[2] = frame[3] = 0, frame[4] = 0x12, frame[5] = 0x00;
     for (int i = 0; i < linkLeds; i++) frame[6 + i * 3] = r, frame[7 + i * 3] = g, frame[8 + i * 3] = b;
     BOOL ok = linkCmd(softMode, sizeof(softMode), NULL, 0) && linkCmd(close, sizeof(close), endpoint, 1) &&
@@ -405,6 +412,7 @@ static BOOL linkTemp(double *t) {
     BOOL ok, got = FALSE;
     if (link == INVALID_HANDLE_VALUE) link = openHid(L"vid_1b1c&pid_0c3f", L"mi_00", FILE_FLAG_OVERLAPPED);
     if (link == INVALID_HANDLE_VALUE) return FALSE;
+    linkSync();
     ok = linkCmd(close, sizeof(close), endpoint, 1) && linkCmd(open, sizeof(open), endpoint, 1);
     if (ok) {
         out[2] = 1;
@@ -424,7 +432,7 @@ static BOOL linkTemp(double *t) {
         }
     }
     if (ok) ok = linkCmd(close, sizeof(close), endpoint, 1);
-    if (!ok) {
+    if (!ok || !got) {
         CloseHandle(link);
         link = INVALID_HANDLE_VALUE;
     }
