@@ -36,7 +36,7 @@
 
 enum {
     H_NONE, H_SCREENS, H_GEAR, H_BACK, H_TAB_FANS, H_TAB_WAKE, H_TAB_SYSTEM, H_RGB, H_SYNC, H_CURVE, H_START, H_EXIT,
-    H_MAX_DN, H_MAX_UP, H_HYS_DN, H_HYS_UP, H_RESET, H_HOTKEY, H_WAKE_CLICK, H_WAKE_ESC, H_NOTICE, H_COUNT
+    H_MAX_DN, H_MAX_UP, H_HYS_DN, H_HYS_UP, H_RESET, H_HOTKEY, H_WAKE_CLICK, H_WAKE_ESC, H_NOTICE, H_OVR_DN, H_OVR_UP, H_OVR, H_COUNT
 };
 enum { F_BRAND, F_ROW, F_SMALL, F_BIG, F_UNIT, F_BOLD, F_TINY, F_COUNT };
 enum { V_MAIN, V_FANS, V_WAKE, V_SYSTEM };
@@ -279,22 +279,26 @@ static void toggleRow(LPCWSTR label, LPCWSTR hint, float x, float y, float w, in
     if (hint) text(hint, F_TINY, rc(x + INSET, y + 26, w - 80, 14), dim(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
     toggle(x + w - INSET - 40, y + 12, on, hover == id, enabled);
 }
-// Label and hint on the left, [-] value [+] on the right.
-static void stepperRow(LPCWSTR label, LPCWSTR hint, LPCWSTR value, float x, float y, float w, int down, int up, BOOL canDown, BOOL canUp) {
-    float bx = x + w - INSET - 28;
-    text(label, F_ROW, rc(x + INSET, y + 6, w - 160, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    text(hint, F_TINY, rc(x + INSET, y + 26, w - 160, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+// [-] value [+] in a row at y, ending at right. a dims the whole control.
+static void stepper(LPCWSTR value, float right, float y, int down, int up, BOOL canDown, BOOL canUp, float a) {
+    float bx = right - 28;
     for (int i = 0; i < 2; i++) {
         int id = i ? up : down;
         BOOL can = i ? canUp : canDown;
         D2D1_RECT_F r = rc(i ? bx : bx - 28 - 52, y + 8, 28, 28);
         float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
         if (can) hit[id] = r;
-        fillRound(r, 6, tone(), !can ? 0.03f : hover == id ? 0.12f : 0.06f);
-        line(cx - 5, cy, cx + 5, cy, ink(), can ? 1 : 0.3f, 1.5f);
-        if (i) line(cx, cy - 5, cx, cy + 5, ink(), can ? 1 : 0.3f, 1.5f);
+        fillRound(r, 6, tone(), (!can ? 0.03f : hover == id ? 0.12f : 0.06f) * a);
+        line(cx - 5, cy, cx + 5, cy, ink(), (can ? 1 : 0.3f) * a, 1.5f);
+        if (i) line(cx, cy - 5, cx, cy + 5, ink(), (can ? 1 : 0.3f) * a, 1.5f);
     }
-    text(value, F_BOLD, rc(bx - 52, y + 13, 52, 18), ink(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+    text(value, F_BOLD, rc(bx - 52, y + 13, 52, 18), ink(), a, DWRITE_TEXT_ALIGNMENT_CENTER);
+}
+// Label and hint on the left, [-] value [+] on the right.
+static void stepperRow(LPCWSTR label, LPCWSTR hint, LPCWSTR value, float x, float y, float w, int down, int up, BOOL canDown, BOOL canUp) {
+    text(label, F_ROW, rc(x + INSET, y + 6, w - 160, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    text(hint, F_TINY, rc(x + INSET, y + 26, w - 160, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    stepper(value, x + w - INSET, y, down, up, canDown, canUp, 1);
 }
 
 // ---- Layout ----
@@ -305,7 +309,7 @@ static int capped(int d) { return d > fanMax ? fanMax : d; }
 
 static float mainHeight(void) {
     float h = PAD + 32 + SECT + LABEL + 2 * ROW;
-    if (hasCurve) h += SECT + LABEL + INSET + 56 + GAP + 48 + GAP + 44 + INSET + ROW;
+    if (hasCurve) h += SECT + LABEL + INSET + 56 + GAP + 48 + GAP + 44 + INSET + 2 * ROW;
     else if (fanWhy >= 2) h += GAP + ROW; // notice: the fan curve is set up but can't run
     return h + PAD;
 }
@@ -409,7 +413,7 @@ static void paintMain(float x, float y, float w) {
     y += 2 * ROW + SECT;
 
     section(L"COOLING", x, &y, w);
-    card(x, y, w, INSET + 56 + GAP + 48 + GAP + 44 + INSET + ROW);
+    card(x, y, w, INSET + 56 + GAP + 48 + GAP + 44 + INSET + 2 * ROW);
     float cy = y + INSET;
     // Two big readings on the left, the graph's range on the right.
     if (coolant < 0) lstrcpyW(s, L"--");
@@ -421,8 +425,10 @@ static void paintMain(float x, float y, float w) {
     else wsprintfW(s, L"%d", fanDuty);
     text(s, F_BIG, rc(ix + 118, cy - 4, 110, 40), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     if (fanDuty >= 0) text(L"%", F_UNIT, rc(ix + 120 + measure(s, F_BIG), cy + 10, 24, 22), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    text(fanDuty >= 0 && fanMax < 100 && fanDuty >= fanMax ? L"Fans (at max)" : L"Fans", F_SMALL, rc(ix + 118, cy + 38, 110, 18), dim(), 1,
-         DWRITE_TEXT_ALIGNMENT_LEADING);
+    int ov = ovState();
+    text(ov == 1 ? L"Fans (override)" : ov == 2 ? (srcDev ? L"Override paused: too hot" : L"Override paused: water hot")
+         : fanDuty >= 0 && fanMax < 100 && fanDuty >= fanMax ? L"Fans (at max)" : L"Fans",
+         F_SMALL, rc(ix + 118, cy + 38, iw - 118, 18), ov == 2 ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     int lo = 99999, hi = -99999;
     for (int i = 0; i < historyLen; i++) {
         int v = history[(historyPos - historyLen + i + HISTORY) % HISTORY];
@@ -474,6 +480,22 @@ static void paintMain(float x, float y, float w) {
     cy += 44 + INSET;
     divider(x, cy, w);
     toggleRow(srcDev ? L"Follow the temperature" : L"Follow water temperature", NULL, x, cy, w, H_CURVE, curveOn, TRUE);
+    // Override: a fixed speed instead of the curve. Works while the curve is on; the speed can be set before switching on.
+    cy += ROW;
+    divider(x, cy, w);
+    float a = curveOn ? 1 : 0.4f, right = x + w - INSET - 40 - GAP;
+    if (curveOn) {
+        hit[H_OVR] = rc(x, cy, w, ROW);
+        hoverFill(H_OVR, hit[H_OVR]);
+    }
+    text(L"Override", F_ROW, rc(ix, cy + 6, right - 108 - ix - 8, 22), ink(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
+    text(ov == 2 ? L"Paused while hot" : L"Fixed fan speed", F_TINY, rc(ix, cy + 26, right - 108 - ix - 8, 14), ov == 2 ? warn() : dim(), a,
+         DWRITE_TEXT_ALIGNMENT_LEADING);
+    wsprintfW(s, L"%d%%", ovDuty);
+    stepper(s, right, cy, H_OVR_DN, H_OVR_UP, curveOn && ovDuty > 20, curveOn && ovDuty < 100, ovOn && curveOn ? 1 : 0.4f);
+    // A button at the end of the range still takes the click, so it never falls through to the switch.
+    if (curveOn) hit[H_OVR_DN] = rc(right - 108, cy + 8, 28, 28), hit[H_OVR_UP] = rc(right - 28, cy + 8, 28, 28);
+    toggle(x + w - INSET - 40, cy + 12, ovOn, hover == H_OVR, curveOn);
 }
 
 static void paintFans(float x, float y, float w) {
@@ -882,6 +904,18 @@ static void panelClick(int id) {
         if (panelTest) curveOn = !curveOn, fanDuty = curveOn ? curveAt(coolant) : -1;
         else SendMessageW(panelOwner, WM_COMMAND, ID_CURVE, 0);
         break;
+    case H_OVR:
+        if (panelTest) ovOn = !ovOn, fanDuty = coolant < 0 ? -1 : fanTarget(TRUE);
+        else SendMessageW(panelOwner, WM_COMMAND, ID_OVERRIDE, 0);
+        break;
+    case H_OVR_DN:
+    case H_OVR_UP:
+        ovDuty += id == H_OVR_UP ? 5 : -5;
+        ovDuty = ovDuty < 20 ? 20 : ovDuty > 100 ? 100 : ovDuty;
+        setPref(L"OverrideDuty", ovDuty);
+        if (panelTest) fanDuty = coolant < 0 ? -1 : fanTarget(TRUE);
+        else if (ovOn) curveApplyNow(), tipUpdate();
+        break;
     case H_START:
         if (panelTest) setPref(L"Start", !pref(L"Start", 1));
         else toggleStartup();
@@ -1149,7 +1183,7 @@ static BOOL panelShow(HWND owner) {
 //   --panel-test  [flags]              open the panel with preview data; exits on close
 //   --panel-shot  [flags] out=<file>   draw one view off-screen to a .bmp, no window at all (README images, reviews)
 //   --panel-bench                      open and close five times, never shown; log time and memory to %TEMP%
-// Flags: fans wake system | light | x2 | nofans notadmin noread curveoff atcap nohist | hotkey wakes edited rgboff
+// Flags: fans wake system | light | x2 | nofans notadmin noread curveoff atcap nohist override ovhot | hotkey wakes edited rgboff
 //        hover=<id> drag=<point> shade=<percent> grey=<percent>
 
 static BOOL flag(LPCWSTR cmd, LPCWSTR name) {
@@ -1240,7 +1274,13 @@ static int panelDev(LPWSTR cmd) {
     setPref(L"HotkeyMode", flag(cmd, L"hotkey")), setPref(L"WakeClick", 1), setPref(L"WakeEsc", 1), setPref(L"Edited", flag(cmd, L"edited"));
     coolant = flag(cmd, L"noread") ? -1 : wcsstr(cmd, L"--panel-shot") ? 28.6 : getDword(L"Coolant", 286) / 10.0;
     curveOn = !flag(cmd, L"curveoff");
-    fanDuty = !curveOn || coolant < 0 ? -1 : flag(cmd, L"atcap") ? fanMax : curveAt(coolant);
+    ovOn = flag(cmd, L"override") || flag(cmd, L"ovhot"), ovDuty = 60;
+    if (hasCurve && coolant >= 0 && flag(cmd, L"ovhot")) {
+        double top = 0;
+        curvePeak(&top);
+        coolant = top + 1.5; // past the top of the curve: the override pauses
+    }
+    fanDuty = !curveOn || coolant < 0 ? -1 : flag(cmd, L"atcap") ? fanMax : fanTarget(TRUE);
     if (hasCurve && coolant >= 0 && !flag(cmd, L"nohist")) {
         // Preview data: a smooth warm-up that ends at the current reading.
         for (int i = 0; i < HISTORY; i++) {

@@ -21,6 +21,7 @@
 #define ID_FANCTL    7
 #define ID_CURVE     8
 #define ID_DEVICES   9
+#define ID_OVERRIDE  10
 #define ID_FAN_AWAKE 100
 #define ID_FAN_SLEEP 200
 #define TIMER_OFF    1
@@ -943,22 +944,57 @@ static int curveAt(double t) {
     return d > fanMax ? fanMax : d;
 }
 
-// Re-applies the curve to the current reading straight away (used after a panel edit).
+// Override: one fixed duty instead of the curve, not capped by max. It pauses while the temperature is past the point
+// where the curve reaches its top (the curve runs then, never below the override) and resumes 2 C below that point.
+static BOOL ovOn, ovPaused;
+static int ovDuty = 60;
+
+// The top of the curve (capped by max) and the temperature where the curve gets there.
+static int curvePeak(double *at) {
+    int peak = 0;
+    for (int i = 0; i < curveN; i++)
+        if (curveD[i] > peak) peak = curveD[i];
+    if (peak > fanMax) peak = fanMax;
+    for (int i = 0; i < curveN; i++)
+        if (curveD[i] >= peak) {
+            *at = !i ? curveT[0] : curveT[i - 1] + (double)(peak - curveD[i - 1]) * (curveT[i] - curveT[i - 1]) / (curveD[i] - curveD[i - 1]);
+            break;
+        }
+    return peak;
+}
+
+// The duty for the current reading: the override, or the curve with its hysteresis (none when now is set).
+static int fanTarget(BOOL now) {
+    double top = 0;
+    if (!ovOn || curvePeak(&top) <= ovDuty) ovPaused = FALSE;
+    else if (coolant > top) ovPaused = TRUE;
+    else if (coolant <= top - 2) ovPaused = FALSE;
+    if (ovOn && !ovPaused) return ovDuty;
+    int up = curveAt(coolant), down = curveAt(coolant + fanHyst);
+    int duty = now || fanDuty < 0 || up > fanDuty ? up : down < fanDuty ? down : fanDuty;
+    return ovOn && duty < ovDuty ? ovDuty : duty;
+}
+
+// 1 = the override holds the fans, 2 = it is paused because the temperature is past the top of the curve.
+static int ovState(void) { return !ovOn || !curveOn || fanDuty < 0 ? 0 : ovPaused ? 2 : 1; }
+
+// Re-applies the curve (or the override) to the current reading straight away (used after a panel edit).
 static void curveApplyNow(void) {
     if (coolant < 0 || !curveOn) return;
-    int duty = curveAt(coolant);
+    int duty = fanTarget(TRUE);
     if (duty != fanDuty || !fanManual) fansSet(duty);
 }
 
 // Tray tooltip with the live reading, rewritten only when the whole-degree value or the duty changes.
 static void tipUpdate(void) {
     static int shown = -2;
-    int key = coolant < 0 ? -1 : (int)(coolant + 0.5) * 1000 + (fanDuty < 0 ? 999 : fanDuty);
+    int key = coolant < 0 ? -1 : ovState() * 100000 + (int)(coolant + 0.5) * 1000 + (fanDuty < 0 ? 999 : fanDuty);
     if (key == shown) return;
     shown = key;
     if (coolant < 0) lstrcpyW(nid.szTip, L"Blackout \x00B7 No temperature reading \x00B7 Fans on the BIOS curve");
     else if (fanDuty < 0) wsprintfW(nid.szTip, L"Blackout \x00B7 %s %d \x00B0" L"C \x00B7 Fans on the BIOS curve", srcLabel, (int)(coolant + 0.5));
-    else wsprintfW(nid.szTip, L"Blackout \x00B7 %s %d \x00B0" L"C \x00B7 Fans %d%%", srcLabel, (int)(coolant + 0.5), fanDuty);
+    else wsprintfW(nid.szTip, L"Blackout \x00B7 %s %d \x00B0" L"C \x00B7 Fans %d%%%s", srcLabel, (int)(coolant + 0.5), fanDuty,
+                   ovState() == 1 ? L" (override)" : ovState() == 2 ? L" (override paused)" : L"");
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
@@ -990,8 +1026,7 @@ static void fanTick(void) {
         panelUpdate();
         return;
     }
-    int up = curveAt(coolant), down = curveAt(coolant + fanHyst);
-    int duty = fanDuty < 0 || up > fanDuty ? up : down < fanDuty ? down : fanDuty;
+    int duty = fanTarget(FALSE);
     if (duty != fanDuty || !fanManual) fansSet(duty);
     tipUpdate();
     panelUpdate();
@@ -1156,6 +1191,8 @@ static void showMenu(HWND hwnd) {
         else wsprintfW(label, L"%s %d.%d C, fans %d%%", srcLabel, (int)coolant, (int)(coolant * 10) % 10, fanDuty);
         AppendMenuW(curve, MF_STRING | MF_GRAYED, 0, label);
         AppendMenuW(curve, MF_STRING | (curveOn ? MF_CHECKED : 0), ID_CURVE, L"Follow the temperature");
+        wsprintfW(label, L"Override at %d%%", ovDuty);
+        AppendMenuW(curve, MF_STRING | (ovOn ? MF_CHECKED : 0) | (curveOn ? 0 : MF_GRAYED), ID_OVERRIDE, label);
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)curve, L"Fan curve");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -1320,6 +1357,13 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (curveOn) fanTick();
             else fansRelease(), tipUpdate();
             return 0;
+        case ID_OVERRIDE:
+            ovOn = !ovOn;
+            setDword(L"Override", ovOn);
+            curveApplyNow();
+            tipUpdate();
+            panelUpdate();
+            return 0;
         case ID_DEVICES: {
             // Write the device report from this (elevated) instance, without opening it. For checking a machine remotely.
             WCHAR cmd[MAX_PATH + 32] = L"\"";
@@ -1449,6 +1493,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     hasRam = GetFileAttributesW(fury) != INVALID_FILE_ATTRIBUTES;
     setFans(-1);
     litOn = getDword(L"RgbOn", 1), litWant = getDword(L"RgbWant", 1), curveOn = getDword(L"FanCurve", 1);
+    ovOn = getDword(L"Override", 0), ovDuty = (int)getDword(L"OverrideDuty", 60);
+    if (ovDuty < 20 || ovDuty > 100) ovDuty = 60;
     hasCurve = outCount && curveN && fansInit();
     // An elevated window drops messages from normal processes unless allowed (tray clicks and remote "screens off").
     ChangeWindowMessageFilterEx(hwnd, WM_COMMAND, MSGFLT_ALLOW, NULL);

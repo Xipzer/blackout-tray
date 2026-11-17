@@ -25,7 +25,7 @@ This works for a Blackout click and for Windows' own display timeout.
 <img src="docs/panel-system.png" width="280" alt="System and status">
 </p>
 
-- **Main:** Screens off, RGB, turn RGB off with the screens. With a fan curve: the temperature, fan speed, a 15 minute graph, RPM per fan and the curve on/off switch.
+- **Main:** Screens off, RGB, turn RGB off with the screens. With a fan curve: the temperature, fan speed, a 15 minute graph, RPM per fan, the curve on/off switch and the override.
 - **Settings > Fans:** the fan curve (drag a point, double-click to add one, right-click to remove one), max fan speed, how far the temperature must drop before fans slow down, reset.
 - **Settings > Wake:** Hotkey mode, and a list of what woke the screens last, with the device behind it.
 - **Settings > System:** Start with Windows, Exit, and a status list of what Blackout found on this PC.
@@ -65,6 +65,8 @@ One temperature drives up to 7 fans along a curve you draw in the panel. The usu
 4. Run Blackout as admin and tick **Start with Windows**. As admin this creates a logon task, so there is no UAC prompt at login.
 
 Edit the curve in the panel (Settings > Fans): drag a point, double-click the chart to add one, right-click a point to remove it, and set max fan speed and the slow-down margin. Changes apply at once and are kept in `HKCU\Software\Blackout` (`Curve`, `FanMax`, `Hysteresis`), which override the ini. **Reset to blackout.ini** drops them.
+
+**Override** (panel main view, or the tray menu) runs the fans at one fixed speed, 20 to 100%, instead of the curve. It pauses while the temperature is above the point where the curve reaches its top, and comes back once it is 2 C below that.
 
 Fans go up straight away and come down after the hysteresis. Motherboard fans go back to the BIOS curve when the temperature reading is lost for 20 s, on exit, sleep and shutdown, and when the curve is switched off. Set a sensible fixed speed or curve in the BIOS: it is what runs whenever Blackout does not.
 
