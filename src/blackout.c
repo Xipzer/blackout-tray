@@ -65,6 +65,9 @@ static WCHAR fanNames[96], outSpec[200], srcSpec[64];
 // What the curve follows, for the panel and the tooltip: "Water" from "the iCUE LINK hub" unless [fans] source= says otherwise.
 static WCHAR srcLabel[24] = L"Water", srcFrom[48] = L"the iCUE LINK hub";
 static double coolant = -1;
+// [gpu] clock cap that follows the coolant: below cold_below the GPU is capped at cap_cold MHz, above warm_above at
+// cap_warm (nvidia-smi -lgc 210,<cap>; needs admin). Re-sent every minute, because a driver reset drops the cap.
+static int gpuCapCold, gpuCapWarm, gpuColdBelow = 30, gpuWarmAbove = 32, gpuCapNow, gpuCapAge;
 // Coolant history for the panel graph: 15 min at one sample per 4 s tick, C x100.
 #define HISTORY 225
 static short history[HISTORY];
@@ -285,6 +288,10 @@ static void loadConfig(void) {
     // Optional names for the panel, in the order of outputs=: names=Top,Side,Bottom
     GetPrivateProfileStringW(L"fans", L"names", L"", fanNames, 96, iniPath);
     linkSensor = GetPrivateProfileIntW(L"fans", L"sensor", -1, iniPath);
+    gpuCapCold = GetPrivateProfileIntW(L"gpu", L"cap_cold", 0, iniPath);
+    gpuCapWarm = GetPrivateProfileIntW(L"gpu", L"cap_warm", 0, iniPath);
+    gpuColdBelow = GetPrivateProfileIntW(L"gpu", L"cold_below", 30, iniPath);
+    gpuWarmAbove = GetPrivateProfileIntW(L"gpu", L"warm_above", 32, iniPath);
 }
 
 // Corsair Commander Pro over raw HID: report [0, 0x23, channel, duty%] sets a fixed duty (liquidctl's protocol).
@@ -998,6 +1005,25 @@ static void tipUpdate(void) {
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
+static void gpuCapTick(void) {
+    if (!gpuCapCold || !gpuCapWarm || coolant < 0) return;
+    int want = gpuCapNow ? gpuCapNow : gpuCapWarm;
+    if (coolant < gpuColdBelow) want = gpuCapCold;
+    else if (coolant > gpuWarmAbove) want = gpuCapWarm;
+    if (want == gpuCapNow && ++gpuCapAge < 15) return;
+    if (want != gpuCapNow) setDword(L"GpuCap", (DWORD)want);
+    gpuCapNow = want, gpuCapAge = 0;
+    WCHAR cmd[96];
+    wsprintfW(cmd, L"nvidia-smi.exe -lgc 210,%d", want);
+    STARTUPINFOW si = {sizeof(si)};
+    PROCESS_INFORMATION pi;
+    // Not waited on: nvidia-smi can stall for seconds while the driver recovers.
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
 // Every 4 s: the temperature is averaged over ~30 s, fans go up straight away and come down only once it is
 // [fans] hysteresis C cooler. No reading for 20 s hands the fans back to the BIOS.
 static void fanTick(void) {
@@ -1020,6 +1046,7 @@ static void fanTick(void) {
     }
     if (panel) fansReadRpm();
     if (coolant < 0) return;
+    gpuCapTick();
     if (!curveOn) {
         fansRelease();
         tipUpdate();
