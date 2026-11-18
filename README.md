@@ -117,10 +117,18 @@ The same tab lists the last few wakes and the device behind each one (for exampl
 | | `names` | Panel labels for the fans, in the order of `outputs`, e.g. `Top,Side,Bottom` |
 | | `curve` | `C:duty` points, e.g. `30:40,45:100` |
 | | `hysteresis` | C the temperature must drop before fans slow down (default 2) |
+| `[gpu]` | `cap_cold`, `cap_warm` | Optional NVIDIA clock cap in MHz that follows the coolant (see below). Both 0 (default) = off |
+| | `cold_below`, `warm_above` | Coolant C: the cold cap applies below `cold_below` (default 30), the warm cap above `warm_above` (default 32) |
 
 Fan speeds and toggles are set from the tray menu and kept in `HKCU\Software\Blackout`.
 
 To find a monitor's hardware ID: Device Manager > Monitors > Properties > Details > Hardware Ids.
+
+## GPU clock cap (optional)
+
+For an overclocked NVIDIA card on the same water loop. A cold GPU core gets extra boost bins from the driver, and an overclocked curve may not survive them.
+With `[gpu] cap_cold` and `cap_warm` set, Blackout sends `nvidia-smi -lgc 210,<cap>` when the coolant crosses the thresholds, and again every minute, because a driver reset drops the cap.
+It needs Blackout to run as admin. Leave both at 0 if you do not need it.
 
 ## FURY module (optional)
 
@@ -150,6 +158,24 @@ Measured on Windows 11.
 - **OpenRGB with Corsair Commander Pro or Lighting Node Pro:** set each channel's LED count once in OpenRGB (Zone Initialization). Static mode won't light a zone of size 0.
 - **OpenRGB with an iCUE LINK hub:** disable OpenRGB's "Corsair iCUE Link System Hub" detector. Blackout drives the hub itself.
 - **Screens off** briefly sets the Windows display timeout to 1 second, then restores your value.
+
+## Quirks and remedies
+
+Things we hit running Blackout every day on a water-cooled desktop (ASRock Z790 board with a Nuvoton NCT6796D, Corsair iCUE LINK hub, four monitors). Each one is either handled in the app or needs a setting from you.
+
+| Quirk | What you see | Remedy |
+|---|---|---|
+| Fans go to the BIOS curve whenever Blackout is not driving them | A loud burst at exit, restart, sleep and shutdown | Set a sensible fixed speed or curve in the BIOS: it runs whenever Blackout does not |
+| Restarting Blackout | Fans loud for a few seconds; the LINK hub shows its stored hardware colour until Blackout takes it over | Expected. Avoid restarting it while you want the room dark |
+| HWiNFO (or another monitor) starts while Blackout drives the fans | Board fans at about 3,000 rpm for about 45 s while HWiNFO probes the Super I/O chip | Expected; Blackout shares the standard ISA bus mutex, and takes the fans back afterwards. Public reports of the same clash with other fan tools: [HWiNFO forum](https://www.hwinfo.com/forum/threads/hwinfo64-taking-over-fancontrol-sensor-settings.8390/), [r/FanControl](https://www.reddit.com/r/FanControl/comments/1goa24j/fan_control_borked_by_hwinfo/) |
+| Another program (HWiNFO, iCUE) has the LINK hub open too | Coolant reading lost; Blackout read the other program's replies | Fixed: Windows gives every open HID handle a copy of each input report ([Microsoft](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/hidsdi/nf-hidsdi-hidd_flushqueue), [OSR](https://community.osr.com/t/theory-buffering-in-hid-class-driver/30591)), so Blackout flushes the queue before each exchange and reopens the handle on a reply that does not match |
+| Three programs polling one LINK hub | The hub crashed once | Let one program own the hub. In OpenRGB, disable its iCUE LINK detector |
+| Two fan chains on one 1 A header | A chain of three 120 mm fans draws about 0.9 to 1.3 A at 100% | Cap `max=` (we run 80%) until the fans have a powered hub |
+| The legacy monitor-off broadcast | A monitor on the motherboard's iGPU came straight back; some iGPU DisplayPort outputs stayed half awake ("No Signal" flashes) | Blackout sets the display timeout to 1 s instead; list such monitors in `[ddc] monitors=` so they are powered off over DDC/CI. Best: run every monitor from the graphics card |
+| Kingston FURY RGB not seen by OpenRGB | RAM stays lit | Use the FURY module. Keep Kingston FURY CTRL installed: it is also what blanks the DIMM lighting on sleep |
+| A bumped mouse wakes the screens at night | | Hotkey mode |
+| Run key and logon task both present | Whichever starts first holds the single-instance lock. If that is the non-admin Run-key copy, there is no fan control | Use one: as admin, **Start with Windows** makes the logon task |
+| A GPU driver reset | A clock cap set with `nvidia-smi -lgc` is gone | The `[gpu]` cap is re-sent every minute |
 
 ## Build
 
