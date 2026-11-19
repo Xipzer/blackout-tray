@@ -68,7 +68,7 @@ One temperature drives up to 7 fans along a curve you draw in the panel. The usu
 
 Edit the curve in the panel (Settings > Fans): drag a point, double-click the chart to add one, right-click a point to remove it, and set max fan speed and the slow-down margin. Changes apply at once and are kept in `HKCU\Software\Blackout` (`Curve`, `FanMax`, `Hysteresis`), which override the ini. **Reset to blackout.ini** drops them.
 
-**Override** (panel main view, or the tray menu) runs the fans at one fixed speed, 20 to 100%, instead of the curve. It pauses while the temperature is above the point where the curve reaches its top, and comes back once it is 2 C below that.
+**Override** (panel main view, or the tray menu) runs the fans at one fixed speed, 20 to 100%, instead of the curve. **Override speed** under it sets that speed, also before the override is switched on. It pauses while the temperature is above the point where the curve reaches its top, and comes back once it is 2 C below that.
 
 Fans go up straight away and come down after the hysteresis. Motherboard fans go back to the BIOS curve when the temperature reading is lost for 20 s, on exit, sleep and shutdown, and when the curve is switched off. Set a sensible fixed speed or curve in the BIOS: it is what runs whenever Blackout does not.
 
@@ -144,7 +144,7 @@ On a PC with an NVIDIA driver the panel's Settings have a **GPU** tab:
 - **Profiles** along the top. Clicking one only shows it: its clock curve over the card's own curve (the grey line), the top of the curve with the lowest voltage that reaches it, the power limit in % and the memory offset in MHz. **Apply** sends it. Red marks the profile that is on the card.
 - **Read from card** keeps what the card is running now as the profile on show, so an overclock you have tuned and tested in any app becomes a Blackout profile with one click. **+** is the next empty profile. A profile that exists asks before it is replaced.
 - Click a profile's name to change it.
-- **XBAR**: step through the `xbar` values from `blackout.ini`. Sent a moment after the last step.
+- **XBAR offset**: the minus and plus under it step through the `xbar` values from `blackout.ini`. Sent a moment after the last step, and kept when you change profile.
 - The line at the bottom says what the driver answered. The Main view and the tray tooltip repeat it.
 
 Nothing is read from the card while the panel is open; **Read from card** reads it once.

@@ -30,7 +30,7 @@ The same from a command line: `blackout.exe --gpu-save 1` (to `5`), then restart
 - A profile pill only shows that profile. **Apply** sends it and makes it the one that is sent again after a restart or a driver reset.
 - Red means on the card: the pill, and the curve. A profile that is only being looked at is drawn without colour.
 - The chart is the profile's clock curve (MHz over volts) over the card's own curve in grey. The marker is the top of the curve at the lowest voltage that reaches it. The card's own curve is known once a profile has been sent or read.
-- Under the chart: power limit in % of the card's default, memory offset in MHz, and the XBAR stepper.
+- Under the chart: power limit in % of the card's default, memory offset in MHz and XBAR offset in MHz. XBAR has a minus and plus under it; it belongs to the card, so it stays the same when you change profile.
 - The bottom line is what the driver answered: `Applied at 09:15`, or `Not applied` with the reason, for example `Memory offset refused (-104)`.
 
 ```ini
