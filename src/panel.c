@@ -9,7 +9,7 @@
 // widths written down here, which Segoe UI Variable and Segoe UI (Windows 10) share. Measured with --panel-bench.
 //
 // Look: docked flush to the taskbar and the screen edge, square on those sides, one rounded corner facing the desktop,
-// and filled with the taskbar's own colour (sampled when it opens) so it reads as part of the same surface.
+// and filled with one neutral colour per theme.
 //
 // One view, no pages and no tabs. From the top: Screens off, the lighting card (only when lighting is set up), the
 // wake rules with the log of what woke the screens (only once something has), Start with Windows, and at the foot
@@ -67,7 +67,6 @@ static int hover;
 // startOn is read once when the panel opens. panelTest: a developer mode, where no switch reaches the PC.
 static BOOL dockTop, panelLight, panelTest, panelHidden, dirty, startOn;
 static DWORD panelClosedAt;
-static UINT panelTint; // 0xRRGGBB taken from the taskbar, 0 = none
 
 // ---- Drawing primitives ----
 
@@ -80,7 +79,7 @@ static UINT dim(void) { return panelLight ? 0x5F5F66 : 0xA8A8AD; }
 static UINT tone(void) { return panelLight ? 0x000000 : 0xFFFFFF; }
 static UINT warn(void) { return panelLight ? 0xB45309 : WARN; }
 static UINT good(void) { return panelLight ? 0x1A7F37 : GOOD; }
-static UINT baseColor(void) { return panelTint ? panelTint : panelLight ? 0xEDEDED : 0x1C1E20; }
+static UINT baseColor(void) { return panelLight ? 0xEDEDED : 0x1C1E20; }
 
 static void paint(UINT rgb, float a) {
     D2D1_COLOR_F c = rgba(rgb, a);
@@ -660,31 +659,6 @@ static BOOL panelShow(HWND owner) {
         } else {
             wa.bottom = bar.top;
         }
-    }
-    // Take the panel's colour from the taskbar it docks to, unchanged, so it reads as part of the same surface on
-    // any wallpaper, accent colour or transparency setting. One row of taskbar pixels, per-channel median.
-    panelTint = 0;
-    if (docked) {
-        int w = bar.right - bar.left > 512 ? 512 : bar.right - bar.left, hist[3][256] = {{0}};
-        DWORD row[512];
-        BITMAPINFO bi = {{sizeof(BITMAPINFOHEADER), w, -1, 1, 32, BI_RGB, 0, 0, 0, 0, 0}, {{0}}};
-        HDC screen = GetDC(NULL), mem = CreateCompatibleDC(screen);
-        HBITMAP bmp = CreateCompatibleBitmap(screen, w, 1);
-        HGDIOBJ old = SelectObject(mem, bmp);
-        BOOL ok = BitBlt(mem, 0, 0, w, 1, screen, bar.right - w, bar.top <= mi.rcMonitor.top ? bar.bottom - 3 : bar.top + 2, SRCCOPY);
-        SelectObject(mem, old);
-        if (ok && GetDIBits(mem, bmp, 0, 1, row, &bi, DIB_RGB_COLORS)) {
-            for (int i = 0; i < w; i++)
-                for (int c = 0; c < 3; c++) hist[c][(row[i] >> (16 - 8 * c)) & 255]++; // c = 0 is red
-            for (int c = 0; c < 3; c++) {
-                int seen = 0, med = 0;
-                while (med < 255 && (seen += hist[c][med]) * 2 < w) med++;
-                panelTint = panelTint << 8 | (UINT)med;
-            }
-        }
-        DeleteObject(bmp);
-        DeleteDC(mem);
-        ReleaseDC(NULL, screen);
     }
     panelScale = dpiX / 96.0f;
     panelH = panelHeight();
