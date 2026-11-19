@@ -34,6 +34,7 @@
 #define TIMER_ICON   6
 #define TIMER_XBAR   7
 #define TIMER_GPU    8
+#define TIMER_KEEP   9
 #define MAX_LINK_LEDS 160
 #define MAX_WINDOWS  256
 #define MAX_CURVE    8
@@ -1001,15 +1002,21 @@ static void curveApplyNow(void) {
 }
 
 // Tray tooltip with the live reading, rewritten only when the whole-degree value or the duty changes.
+// With GPU profiles it ends with the profile that was sent, or says that it was not.
+static int tipShown = -2;
 static void tipUpdate(void) {
-    static int shown = -2;
-    int key = coolant < 0 ? -1 : ovState() * 100000 + (int)(coolant + 0.5) * 1000 + (fanDuty < 0 ? 999 : fanDuty);
-    if (key == shown) return;
-    shown = key;
-    if (coolant < 0) lstrcpyW(nid.szTip, L"Blackout \x00B7 No temperature reading \x00B7 Fans on the BIOS curve");
+    int gpu = gpuBad() ? 6 : gpuState ? 0 : gpuSentSlot;
+    int key = (!hasCurve ? -2 : coolant < 0 ? -1 : ovState() * 100000 + (int)(coolant + 0.5) * 1000 + (fanDuty < 0 ? 999 : fanDuty)) * 8 + gpu;
+    if (key == tipShown) return;
+    tipShown = key;
+    if (!hasCurve) lstrcpyW(nid.szTip, gpu ? L"Blackout" : L"Blackout: click for screens off, right-click for the panel");
+    else if (coolant < 0) lstrcpyW(nid.szTip, L"Blackout \x00B7 No temperature reading \x00B7 Fans on the BIOS curve");
     else if (fanDuty < 0) wsprintfW(nid.szTip, L"Blackout \x00B7 %s %d \x00B0" L"C \x00B7 Fans on the BIOS curve", srcLabel, (int)(coolant + 0.5));
     else wsprintfW(nid.szTip, L"Blackout \x00B7 %s %d \x00B0" L"C \x00B7 Fans %d%%%s", srcLabel, (int)(coolant + 0.5), fanDuty,
                    ovState() == 1 ? L" (override)" : ovState() == 2 ? L" (override paused)" : L"");
+    if (gpu == 6) lstrcatW(nid.szTip, L" \x00B7 GPU settings not applied");
+    else if (gpu && gpuNames[gpu][0]) wsprintfW(nid.szTip + lstrlenW(nid.szTip), L" \x00B7 GPU %s", gpuNames[gpu]);
+    else if (gpu) wsprintfW(nid.szTip + lstrlenW(nid.szTip), L" \x00B7 GPU profile %d", gpu);
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
@@ -1376,9 +1383,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(hwnd, TIMER_LINK, ok || hasCurve ? 4000 : 30000, NULL);
             return 0;
         }
-        if (wp == TIMER_XBAR || wp == TIMER_GPU) {
-            // The whole profile, or only XBAR. One at a time: try again shortly if the last one is still running.
-            if (!gpuStart(hwnd, wp == TIMER_GPU)) SetTimer(hwnd, wp, 1500, NULL);
+        if (wp == TIMER_XBAR || wp == TIMER_GPU || wp == TIMER_KEEP) {
+            // Only XBAR, the whole profile, or the card read into a profile. One at a time: try again shortly if the
+            // last one is still running.
+            if (!gpuStart(hwnd, wp == TIMER_GPU ? 1 : wp == TIMER_XBAR ? 0 : GPU_KEEP + gpuKeepSlot)) SetTimer(hwnd, wp, 1500, NULL);
             return 0;
         }
         if (wp == TIMER_LAYOUT) {
@@ -1406,8 +1414,23 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_GPU_DONE: {
         // Right after logon the driver may not answer yet: two more tries, then the panel shows what went wrong.
         static int retries;
-        if (gpuState && gpuState != -1 && retries < 2) retries++, SetTimer(hwnd, TIMER_GPU, 30000, NULL);
-        else if (!gpuState) retries = 0;
+        gpuWait = 0;
+        if (wp >= GPU_KEEP) {
+            // A profile was kept from the card. It is what the card runs, so it is the active one from here on.
+            if (!gpuKeptState) {
+                gpuConfig();
+                viewSlot = -1;
+                setDword(L"GpuProfile", (DWORD)(wp - GPU_KEEP));
+                gpuState = 0, gpuSentSlot = (int)(wp - GPU_KEEP), gpuAt = gpuKeptAt;
+                wsprintfW(gpuNote, L"Read from the card at %02d:%02d", gpuAt.wHour, gpuAt.wMinute);
+                gpuWatch(hwnd);
+            }
+        } else if (gpuState && gpuState != -1 && retries < 2) {
+            retries++, SetTimer(hwnd, TIMER_GPU, 30000, NULL);
+        } else if (!gpuState) {
+            retries = 0;
+        }
+        tipUpdate();
         panelUpdate();
         return 0;
     }
@@ -1582,7 +1605,10 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     trim();
 
     MSG m;
-    while (GetMessageW(&m, NULL, 0, 0) > 0) DispatchMessageW(&m);
+    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (naming) TranslateMessage(&m); // typing a profile's name in the panel
+        DispatchMessageW(&m);
+    }
     CloseHandle(mutex);
     return 0;
 }

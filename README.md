@@ -26,12 +26,13 @@ This works for a Blackout click and for Windows' own display timeout.
 <img src="docs/panel-gpu.png" width="280" alt="GPU tab: profile and XBAR offset">
 </p>
 
-- **Main:** Screens off, RGB, turn RGB off with the screens. With a fan curve: the temperature, fan speed, a 15 minute graph, RPM per fan, the curve on/off switch and the override.
+- **Main:** Screens off, RGB, turn RGB off with the screens. With a fan curve: the temperature, fan speed, a 15 minute graph, RPM per fan, the curve on/off switch and the override. With GPU profiles: the profile on the card and what the driver answered.
 - **Settings > Fans:** the fan curve (drag a point, double-click to add one, right-click to remove one), max fan speed, how far the temperature must drop before fans slow down, reset.
-- **Settings > Wake:** Hotkey mode, and a list of what woke the screens last, with the device behind it.
+- **Settings > Wake:** Hotkey mode, and what woke the screens last, with the device behind it.
+- **Settings > GPU:** overclock profiles for an NVIDIA card: the clock curve as a chart, power limit, memory offset, XBAR offset (see [GPU profiles](#gpu-profiles-optional)).
 - **Settings > System:** Start with Windows, Exit, and a status list of what Blackout found on this PC.
 
-Esc goes back or closes the panel. If Direct2D is unavailable, a plain menu appears instead. Hover the tray icon for the temperature and fan speed.
+Esc goes back or closes the panel, the arrow keys change tabs. If Direct2D is unavailable, a plain menu appears instead. Hover the tray icon for the temperature, the fan speed and the GPU profile.
 
 RGB set to off stays off: waking the screens only brings the lighting back if the RGB switch is on.
 
@@ -121,7 +122,7 @@ The same tab lists the last few wakes and the device behind each one (for exampl
 | `[gpu]` | `cap_cold`, `cap_warm` | Optional NVIDIA clock cap in MHz that follows the coolant (see below). Both 0 (default) = off |
 | | `cold_below`, `warm_above` | Coolant C: the cold cap applies below `cold_below` (default 30), the warm cap above `warm_above` (default 32) |
 | | `xbar`, `xbar_default` | XBAR offsets in MHz for the GPU tab's stepper (e.g. `0,300,400,500`), and the one used until another is picked |
-| `[gpu.1]` to `[gpu.5]` | `name`, `power`, `memory`, `curve` | GPU profiles applied natively, written by `--gpu-save N` (see [docs/gpu.md](docs/gpu.md)) |
+| `[gpu.1]` to `[gpu.5]` | `name`, `power`, `memory`, `curve` | GPU profiles applied natively, written by **Read from card** on the GPU tab (see [docs/gpu.md](docs/gpu.md)) |
 
 Fan speeds and toggles are set from the tray menu and kept in `HKCU\Software\Blackout`.
 
@@ -138,14 +139,15 @@ It needs Blackout to run as admin. Leave both at 0 if you do not need it.
 For an overclocked NVIDIA card. Blackout holds the overclock itself and writes it straight to the driver, so no tuning app has to run: a clock curve, a power limit and a memory offset per profile, plus the XBAR (crossbar clock) offset.
 The driver forgets all of it when it resets or the PC restarts, so Blackout sends it again after startup and after a driver reset.
 
-With `[gpu.1]` (and more) or `[gpu] xbar=` in `blackout.ini`, the panel's Settings get a **GPU** tab:
+On a PC with an NVIDIA driver the panel's Settings have a **GPU** tab:
 
-- **Profile**: step between the saved profiles. Applied a moment after the last click.
-- **XBAR offset**: step through the `xbar` values.
-- **Re-apply now**: sends everything again.
-- **Status**: what was sent and what the driver answered.
+- **Profiles** along the top. Clicking one only shows it: its clock curve over the card's own curve (the grey line), the top of the curve with the lowest voltage that reaches it, the power limit in % and the memory offset in MHz. **Apply** sends it. Red marks the profile that is on the card.
+- **Read from card** keeps what the card is running now as the profile on show, so an overclock you have tuned and tested in any app becomes a Blackout profile with one click. **+** is the next empty profile. A profile that exists asks before it is replaced.
+- Click a profile's name to change it.
+- **XBAR**: step through the `xbar` values from `blackout.ini`. Sent a moment after the last step.
+- The line at the bottom says what the driver answered. The Main view and the tray tooltip repeat it.
 
-Save a profile from a card you have already tuned and tested: `blackout.exe --gpu-save 1`.
+Nothing is read from the card while the panel is open; **Read from card** reads it once.
 It uses private driver interfaces and is tested on one card (RTX 5090 FE, driver 621.24). Read [docs/gpu.md](docs/gpu.md) first: setup, limits, the layouts and their sources.
 
 ## FURY module (optional)
@@ -166,7 +168,7 @@ Measured on Windows 11.
 | `blackout.exe` | Always | 0.2 to 0.4 MB | 0% idle |
 | iCUE LINK keep-alive | Every 4 s, only with `[link]` | 5 small USB transfers | ~0% |
 | Fan curve | Same 4 s tick, only with `[fans]` | One temperature read; fan write only when the duty changes. Only the definitions in use are kept, about 2 KB each | ~0% |
-| Panel | Only while open | Opens in about 15 ms, about 15 MB while open, drawn on the CPU so no graphics driver is loaded | Brief |
+| Panel | Only while open | Opens in about 15 ms, 15 to 18 MB while open, drawn on the CPU so no graphics driver is loaded | Brief |
 | `OpenRGB.exe` | 3 to 5 s per change, then exits | ~100 MB while running | Brief |
 | `furyled.exe` | Under 1 s per change | ~10 MB while running | Brief |
 | Kingston FURY CTRL service | Always, if installed | ~40 MB | Kingston's |

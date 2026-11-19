@@ -16,11 +16,22 @@ Tested on one card: RTX 5090 Founders Edition, driver 621.24, Windows 11. Treat 
 ## Set it up
 
 1. Apply your tested overclock with your tuning app.
-2. Run `blackout.exe --gpu-save 1`. It reads the card and writes `[gpu.1]` to `blackout.ini`. Repeat with `2` to `5` for more profiles.
-3. Optionally add `name=` to each section, and `xbar=0,300,400` under `[gpu]` for the XBAR stepper.
-4. Restart Blackout, then stop your tuning app from starting with Windows.
+2. Open the panel (right-click the tray icon), Settings > GPU, and press **Read from card**. It reads the card once and writes `[gpu.1]` to `blackout.ini`. **+** is the next empty profile, up to five.
+3. Click the profile's name to name it. Optionally add `xbar=0,300,400` under `[gpu]` for the XBAR stepper.
+4. Stop your tuning app from starting with Windows.
 
-To carry over several profiles from a tuning app, load each one there and save it under the same number here. To change a profile later, do the same again for that number.
+To carry over several profiles from a tuning app, load each one there, press **+** here and read it in. To change a profile later, show it, press **Read from card** and confirm.
+The profile read from the card becomes the active one, because it is what the card is running.
+
+The same from a command line: `blackout.exe --gpu-save 1` (to `5`), then restart Blackout.
+
+## In the panel
+
+- A profile pill only shows that profile. **Apply** sends it and makes it the one that is sent again after a restart or a driver reset.
+- Red means on the card: the pill, and the curve. A profile that is only being looked at is drawn without colour.
+- The chart is the profile's clock curve (MHz over volts) over the card's own curve in grey. The marker is the top of the curve at the lowest voltage that reaches it. The card's own curve is known once a profile has been sent or read.
+- Under the chart: power limit in % of the card's default, memory offset in MHz, and the XBAR stepper.
+- The bottom line is what the driver answered: `Applied at 09:15`, or `Not applied` with the reason, for example `Memory offset refused (-104)`.
 
 ```ini
 [gpu]
@@ -45,7 +56,7 @@ Commands, each writing its answer to `%TEMP%\blackout-gpu.txt`:
 | Command | What it does |
 |---|---|
 | `--gpu-status` | Reads the card: points, power limit, memory offset, XBAR offset, a sample of the curve |
-| `--gpu-save N` | The same, then saves it as profile N |
+| `--gpu-save N` | The same, then saves it as profile N (what **Read from card** does) |
 | `--gpu-apply N` | Applies profile N now (needs admin) |
 
 ## How it is applied

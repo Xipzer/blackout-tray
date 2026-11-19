@@ -15,6 +15,7 @@
 #define NV_KEEP      0x7FFFFFFF
 #define WM_GPU_RESET (WM_APP + 4)
 #define WM_GPU_DONE  (WM_APP + 5)
+#define GPU_KEEP     2 // gpuStart job: GPU_KEEP + N keeps what the card is running now as profile N
 #define GPU_QUERY    L"*[System[(Provider[@Name='Display'] and EventID=4101) or (Provider[@Name='nvlddmkm'] and (EventID=14 or EventID=153))]]"
 
 typedef void *(*NvQuery)(unsigned);
@@ -33,6 +34,10 @@ static int gpuProfiles, xbarSteps[MAX_XBAR], xbarCount, xbarDefault;
 // For the panel: -1 = nothing sent yet, 0 = sent, anything else = what went wrong (gpuNote says it in words).
 static int gpuState = -1, xbarState = -1, xbarSent;
 static SYSTEMTIME gpuAt, xbarSentAt;
+// For the panel: what it is waiting for (0 nothing, 1 a send, 2 the card being read into a profile), and the last
+// profile kept from the card: its number, 0 or what went wrong, and when.
+static int gpuWait, gpuKept, gpuKeptState, gpuKeepSlot, gpuSentSlot;
+static SYSTEMTIME gpuKeptAt;
 static WCHAR gpuNote[48], gpuNames[6][24];
 // The card's own curve (MHz at each core point's mV), for the panel's chart. Read once, when the offsets are zero.
 static int gpuBase[NV_SLOTS], gpuVolt[NV_SLOTS], gpuPoints;
@@ -41,6 +46,20 @@ static HWND gpuWnd;
 
 static BOOL hasGpu(void) {
     return gpuProfiles || xbarCount;
+}
+
+// The last send was refused, so something that should be on the card is not.
+static BOOL gpuBad(void) {
+    return hasGpu() && (gpuState == -2 || (gpuProfiles && gpuState && gpuState != -1) || (xbarCount && xbarState && xbarState != -1));
+}
+
+// The panel offers its GPU tab, with an empty first profile, on any PC that has the NVIDIA driver's library.
+static BOOL gpuOffered(void) {
+    WCHAR path[MAX_PATH + 16];
+    if (hasGpu()) return TRUE;
+    path[GetSystemDirectoryW(path, MAX_PATH)] = 0;
+    lstrcatW(path, L"\\nvapi64.dll");
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
 static void *nvAlloc(SIZE_T n) {
@@ -224,7 +243,7 @@ static void gpuSay(int r, LPCWSTR what) {
     else if (r == -137) lstrcpyW(gpuNote, L"Needs admin rights");
     else if (r == -1000) lstrcpyW(gpuNote, L"Saved for a different card");
     else if (r == -1001) lstrcpyW(gpuNote, L"The driver changed the curve");
-    else wsprintfW(gpuNote, L"Driver refused the %s (%d)", what, r);
+    else wsprintfW(gpuNote, L"%s refused (%d)", what, r);
 }
 
 static void gpuXbarNow(void) {
@@ -239,38 +258,87 @@ static void gpuXbarNow(void) {
 // (the memory write has zeroed it), never on a wrong one.
 static int gpuApplyNow(int slot) {
     int *delta = nvAlloc(NV_SLOTS * sizeof(int)), power, memory, count = gpuLoad(slot, &power, &memory, delta), r = 0;
-    LPCWSTR what = L"power limit";
+    LPCWSTR what = L"Power limit";
+    gpuSentSlot = slot;
     if (power) r = nvPower(power, NULL);
-    if (!r) what = L"memory offset", r = nvMemory(memory, NULL);
+    if (!r) what = L"Memory offset", r = nvMemory(memory, NULL);
     if (!r && !gpuPoints) nvBaseRead(); // the memory write has just zeroed the offsets
     if (!r && xbarCount) gpuXbarNow();
-    if (!r) what = L"curve", r = nvCurveSet(delta, count);
+    if (!r) what = L"Curve", r = nvCurveSet(delta, count);
     gpuSay(r, what);
     nvFree(delta);
     return r;
 }
 
+// Reads what the card is running now and writes a report for the command line to out. With slot 1 to 5 it is also
+// kept as that profile in blackout.ini. Returns 0 when the card was read and, if asked for, the profile was written;
+// a driver code, -1000 when the card shows no core points, -1002 when blackout.ini could not be written.
+static int gpuRead(int slot, char *out, int *len) {
+    WCHAR sec[16], num[16], *list;
+    int n, power = 0, memory = 0, xbar = 0, wrote = 1;
+    NvCurve *c = nvAlloc(sizeof(NvCurve));
+    int r = nvCurveGet(c), pr = nvPower(NV_KEEP, &power), mr = nvMemory(0, &memory), xr = nvXbar(NV_KEEP, &xbar);
+    n = wsprintfA(out, "curve %d, core points %d\r\npower %d: %d\r\n", r, c->count, pr, power);
+    n += wsprintfA(out + n, "memory %d: %d kHz\r\n", mr, memory);
+    n += wsprintfA(out + n, "xbar %d: %d kHz\r\noffsets kHz:", xr, xbar);
+    for (int i = 0; i < c->count; i += 9) n += wsprintfA(out + n, " %d", *nvDelta(c, c->slot[i]));
+    // A memory offset set by another tool can sit in the table's memory slots instead: keep the larger reading.
+    for (int i = 0; i < NV_SLOTS; i++) {
+        DWORD *point = (DWORD *)(c->info + 0x44 + i * 24);
+        if ((point[0] || point[1] != 1) && *nvDelta(c, i) > memory) memory = *nvDelta(c, i);
+    }
+    n += wsprintfA(out + n, "\r\n");
+    if (!r && !c->count) r = -1000;
+    if (!r && slot >= 1 && slot <= 5) {
+        list = nvAlloc(4096 * sizeof(WCHAR));
+        for (int i = 0, at = 0; i < c->count; i++) at += wsprintfW(list + at, i ? L",%d" : L"%d", *nvDelta(c, c->slot[i]));
+        wsprintfW(sec, L"gpu.%d", slot);
+        wsprintfW(num, L"%d", power);
+        WritePrivateProfileStringW(sec, L"power", num, iniPath);
+        wsprintfW(num, L"%d", memory);
+        WritePrivateProfileStringW(sec, L"memory", num, iniPath);
+        wrote = WritePrivateProfileStringW(sec, L"curve", list, iniPath);
+        n += wsprintfA(out + n, "saved profile %d: %s (power %d, memory %d kHz, %d points)\r\n", slot, wrote ? "ok" : "FAILED", power, memory, c->count);
+        nvFree(list);
+    }
+    nvFree(c);
+    *len = n;
+    return r ? r : wrote ? 0 : -1002;
+}
+
 // NVAPI can stall for seconds while the driver recovers, so nothing here runs on the window's thread.
-static DWORD WINAPI gpuThread(void *full) {
+// job: 0 = only XBAR, 1 = the whole profile and XBAR, GPU_KEEP + N = keep what the card is running as profile N.
+static DWORD WINAPI gpuThread(void *arg) {
+    int job = (int)(INT_PTR)arg, n;
     if (!nvOpen()) {
-        gpuState = -2, lstrcpyW(gpuNote, L"No NVIDIA driver found");
+        if (job >= GPU_KEEP) gpuKeptState = -2;
+        else gpuState = -2, lstrcpyW(gpuNote, L"No NVIDIA driver found");
     } else {
-        if (full && gpuProfiles) gpuApplyNow(gpuSlot());
-        else if (xbarCount) gpuXbarNow();
+        if (job >= GPU_KEEP) {
+            char *text = nvAlloc(2048);
+            gpuKeptState = gpuRead(job - GPU_KEEP, text, &n);
+            if (!gpuKeptState && !gpuPoints) nvBaseRead(); // so the chart can draw it without waiting for a send
+            nvFree(text);
+        } else if (job && gpuProfiles) {
+            gpuApplyNow(gpuSlot());
+        } else if (xbarCount) {
+            gpuXbarNow();
+        }
         nvClose();
     }
+    if (job >= GPU_KEEP) gpuKept = job - GPU_KEEP, GetLocalTime(&gpuKeptAt);
     InterlockedExchange(&gpuBusy, 0);
-    PostMessageW(gpuWnd, WM_GPU_DONE, 0, 0);
+    PostMessageW(gpuWnd, WM_GPU_DONE, (WPARAM)job, 0);
     return 0;
 }
 
-// full: the whole profile and XBAR. Otherwise only XBAR. Returns FALSE while an earlier one is still running.
-static BOOL gpuStart(HWND hwnd, BOOL full) {
+// Returns FALSE while an earlier job is still running.
+static BOOL gpuStart(HWND hwnd, int job) {
     if (InterlockedCompareExchange(&gpuBusy, 1, 0)) return FALSE;
     gpuWnd = hwnd;
-    HANDLE t = CreateThread(NULL, 0, gpuThread, (void *)(INT_PTR)full, 0, NULL);
-    if (t) CloseHandle(t);
-    else InterlockedExchange(&gpuBusy, 0);
+    HANDLE t = CreateThread(NULL, 0, gpuThread, (void *)(INT_PTR)job, 0, NULL);
+    if (t) CloseHandle(t), gpuWait = job >= GPU_KEEP ? 2 : 1;
+    else InterlockedExchange(&gpuBusy, 0), gpuWait = 0;
     return TRUE;
 }
 
@@ -284,6 +352,9 @@ static DWORD WINAPI gpuEvent(int action, void *hwnd, HANDLE event) {
 
 static void gpuWatch(HWND hwnd) {
     typedef HANDLE(WINAPI * Subscribe)(HANDLE, HANDLE, LPCWSTR, LPCWSTR, HANDLE, void *, void *, DWORD);
+    static BOOL on;
+    if (on) return; // once: at startup, or when the first profile is kept from the panel
+    on = TRUE;
     HMODULE lib = LoadLibraryExW(L"wevtapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     Subscribe sub = lib ? (Subscribe)GetProcAddress(lib, "EvtSubscribe") : NULL;
     if (sub) sub(NULL, NULL, L"System", GPU_QUERY, NULL, hwnd, gpuEvent, 1); // EvtSubscribeToFutureEvents
@@ -294,11 +365,10 @@ static void gpuWatch(HWND hwnd) {
 
 static int gpuCommand(LPCWSTR cmd) {
     char out[2048];
-    WCHAR path[MAX_PATH], sec[16], num[16], *list;
+    WCHAR path[MAX_PATH];
     DWORD w;
     LPCWSTR at;
-    int n = 0, power = 0, memory = 0, xbar = 0, r, slot;
-    NvCurve *c;
+    int n = 0, r, slot;
     loadConfig();
     if (!nvOpen()) {
         n = wsprintfA(out, "No NVIDIA driver found\r\n");
@@ -307,31 +377,7 @@ static int gpuCommand(LPCWSTR cmd) {
         r = slot >= 1 && slot <= gpuProfiles ? gpuApplyNow(slot) : -1;
         n = wsprintfA(out, "apply profile %d: %d (%ls), xbar %d: %d\r\n", slot, r, r == -1 ? L"no such profile" : gpuNote, xbarSent, xbarState);
     } else {
-        c = nvAlloc(sizeof(NvCurve));
-        r = nvCurveGet(c);
-        n = wsprintfA(out, "curve %d, core points %d\r\npower %d: %d\r\n", r, c->count, nvPower(NV_KEEP, &power), power);
-        n += wsprintfA(out + n, "memory %d: %d kHz\r\n", nvMemory(0, &memory), memory);
-        n += wsprintfA(out + n, "xbar %d: %d kHz\r\noffsets kHz:", nvXbar(NV_KEEP, &xbar), xbar);
-        for (int i = 0; i < c->count; i += 9) n += wsprintfA(out + n, " %d", *nvDelta(c, c->slot[i]));
-        // A memory offset set by another tool can sit in the table's memory slots instead: keep the larger reading.
-        for (int i = 0; i < NV_SLOTS; i++) {
-            DWORD *point = (DWORD *)(c->info + 0x44 + i * 24);
-            if ((point[0] || point[1] != 1) && *nvDelta(c, i) > memory) memory = *nvDelta(c, i);
-        }
-        n += wsprintfA(out + n, "\r\n");
-        if (!r && c->count && (at = wcsstr(cmd, L"--gpu-save")) && (slot = _wtoi(at + 10)) >= 1 && slot <= 5) {
-            list = nvAlloc(4096 * sizeof(WCHAR));
-            for (int i = 0, len = 0; i < c->count; i++) len += wsprintfW(list + len, i ? L",%d" : L"%d", *nvDelta(c, c->slot[i]));
-            wsprintfW(sec, L"gpu.%d", slot);
-            wsprintfW(num, L"%d", power);
-            WritePrivateProfileStringW(sec, L"power", num, iniPath);
-            wsprintfW(num, L"%d", memory);
-            WritePrivateProfileStringW(sec, L"memory", num, iniPath);
-            r = WritePrivateProfileStringW(sec, L"curve", list, iniPath);
-            n += wsprintfA(out + n, "saved profile %d: %s (power %d, memory %d kHz, %d points)\r\n", slot, r ? "ok" : "FAILED", power, memory, c->count);
-            nvFree(list);
-        }
-        nvFree(c);
+        gpuRead((at = wcsstr(cmd, L"--gpu-save")) ? _wtoi(at + 10) : 0, out, &n);
     }
     if (nvLib) nvClose();
     GetTempPathW(MAX_PATH, path);
