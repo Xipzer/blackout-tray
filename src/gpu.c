@@ -34,6 +34,8 @@ static int gpuProfiles, xbarSteps[MAX_XBAR], xbarCount, xbarDefault;
 static int gpuState = -1, xbarState = -1, xbarSent;
 static SYSTEMTIME gpuAt, xbarSentAt;
 static WCHAR gpuNote[48], gpuNames[6][24];
+// The card's own curve (MHz at each core point's mV), for the panel's chart. Read once, when the offsets are zero.
+static int gpuBase[NV_SLOTS], gpuVolt[NV_SLOTS], gpuPoints;
 static volatile LONG gpuBusy;
 static HWND gpuWnd;
 
@@ -157,6 +159,24 @@ static int nvXbar(int khz, int *now) {
     return r;
 }
 
+static void nvBaseRead(void) {
+    NvCurve *c = nvAlloc(sizeof(NvCurve));
+    BYTE *v = nvAlloc(0x1C28);
+    *(DWORD *)v = 0x00011C28;
+    if (!nvCurveGet(c)) {
+        CopyMemory(v + 4, c->info + 4, 32);
+        if (!nv(0x21537AD4, v)) {
+            for (int i = 0; i < c->count; i++) {
+                DWORD *e = (DWORD *)(v + 0x44 + c->slot[i] * 28);
+                gpuBase[i] = ((int)e[1] - *nvDelta(c, c->slot[i])) / 1000, gpuVolt[i] = (int)e[2] / 1000;
+            }
+            gpuPoints = c->count;
+        }
+    }
+    nvFree(v);
+    nvFree(c);
+}
+
 // ---- Profiles in blackout.ini: [gpu.1] name=  power=  memory=  curve=offset,offset,... (kHz, one per core point) ----
 
 static int gpuLoad(int n, int *power, int *memory, int *delta) {
@@ -222,6 +242,7 @@ static int gpuApplyNow(int slot) {
     LPCWSTR what = L"power limit";
     if (power) r = nvPower(power, NULL);
     if (!r) what = L"memory offset", r = nvMemory(memory, NULL);
+    if (!r && !gpuPoints) nvBaseRead(); // the memory write has just zeroed the offsets
     if (!r && xbarCount) gpuXbarNow();
     if (!r) what = L"curve", r = nvCurveSet(delta, count);
     gpuSay(r, what);
