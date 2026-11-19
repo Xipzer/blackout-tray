@@ -22,6 +22,8 @@
 #define ID_CURVE     8
 #define ID_DEVICES   9
 #define ID_OVERRIDE  10
+#define ID_GPU_APPLY 11
+#define ID_XBAR      1000
 #define ID_FAN_AWAKE 100
 #define ID_FAN_SLEEP 200
 #define TIMER_OFF    1
@@ -30,6 +32,7 @@
 #define TIMER_LAYOUT 4
 #define TIMER_IDLE   5
 #define TIMER_ICON   6
+#define TIMER_XBAR   7
 #define MAX_LINK_LEDS 160
 #define MAX_WINDOWS  256
 #define MAX_CURVE    8
@@ -68,6 +71,12 @@ static double coolant = -1;
 // [gpu] clock cap that follows the coolant: below cold_below the GPU is capped at cap_cold MHz, above warm_above at
 // cap_warm (nvidia-smi -lgc 210,<cap>; needs admin). Re-sent every minute, because a driver reset drops the cap.
 static int gpuCapCold, gpuCapWarm, gpuColdBelow = 30, gpuWarmAbove = 32, gpuCapNow, gpuCapAge;
+// [gpu] XBAR (crossbar clock) offset through MSI Afterburner's out-of-warranty command line (/wpXBARCLK_off,N). It
+// can't be stored in an Afterburner profile and a driver reset drops it, so the choice lives in HKCU Xbar and is
+// re-sent at startup and from the menu. afterburner= empty or xbar= empty hides the GPU menu.
+#define MAX_XBAR 8
+static WCHAR abPath[MAX_PATH];
+static int xbarSteps[MAX_XBAR], xbarCount, xbarDefault;
 // Coolant history for the panel graph: 15 min at one sample per 4 s tick, C x100.
 #define HISTORY 225
 static short history[HISTORY];
@@ -292,6 +301,31 @@ static void loadConfig(void) {
     gpuCapWarm = GetPrivateProfileIntW(L"gpu", L"cap_warm", 0, iniPath);
     gpuColdBelow = GetPrivateProfileIntW(L"gpu", L"cold_below", 30, iniPath);
     gpuWarmAbove = GetPrivateProfileIntW(L"gpu", L"warm_above", 32, iniPath);
+    GetPrivateProfileStringW(L"gpu", L"afterburner", L"", abPath, MAX_PATH, iniPath);
+    GetPrivateProfileStringW(L"gpu", L"xbar", L"", list, 128, iniPath);
+    xbarCount = 0;
+    for (tok = wcstok(list, L",", &ctx); tok && xbarCount < MAX_XBAR; tok = wcstok(NULL, L",", &ctx)) {
+        int v = _wtoi(tok);
+        if (v >= 0 && v <= 1000) xbarSteps[xbarCount++] = v;
+    }
+    xbarDefault = GetPrivateProfileIntW(L"gpu", L"xbar_default", xbarCount ? xbarSteps[xbarCount - 1] : 0, iniPath);
+}
+
+static BOOL hasXbar(void) {
+    return abPath[0] && xbarCount;
+}
+
+// Afterburner applies the write and exits when another instance is already running.
+static void abRun(LPCWSTR args) {
+    WCHAR cmd[MAX_PATH + 64];
+    wsprintfW(cmd, L"\"%s\" %s", abPath, args);
+    spawn(cmd);
+}
+
+static void xbarApply(void) {
+    WCHAR args[40];
+    wsprintfW(args, L"/wpXBARCLK_off,%d", (int)getDword(L"Xbar", (DWORD)xbarDefault));
+    abRun(args);
 }
 
 // Corsair Commander Pro over raw HID: report [0, 0x23, channel, duty%] sets a fixed duty (liquidctl's protocol).
@@ -1222,6 +1256,20 @@ static void showMenu(HWND hwnd) {
         AppendMenuW(curve, MF_STRING | (ovOn ? MF_CHECKED : 0) | (curveOn ? 0 : MF_GRAYED), ID_OVERRIDE, label);
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)curve, L"Fan curve");
     }
+    if (hasXbar()) {
+        HMENU gpu = CreatePopupMenu();
+        WCHAR label[32];
+        DWORD x = getDword(L"Xbar", (DWORD)xbarDefault);
+        AppendMenuW(gpu, MF_STRING | MF_GRAYED, 0, L"XBAR offset");
+        for (int i = 0; i < xbarCount; i++) {
+            if (xbarSteps[i]) wsprintfW(label, L"+%d MHz", xbarSteps[i]);
+            else lstrcpyW(label, L"Off (+0)");
+            AppendMenuW(gpu, MF_STRING | (x == (DWORD)xbarSteps[i] ? MF_CHECKED : 0), ID_XBAR + i, label);
+        }
+        AppendMenuW(gpu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(gpu, MF_STRING, ID_GPU_APPLY, L"Re-apply profile 1 and XBAR");
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)gpu, L"GPU");
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (startupEnabled() ? MF_CHECKED : 0), ID_STARTUP, L"Start with Windows");
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
@@ -1354,6 +1402,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(hwnd, TIMER_LINK, ok || hasCurve ? 4000 : 30000, NULL);
             return 0;
         }
+        if (wp == TIMER_XBAR) {
+            xbarApply();
+            return 0;
+        }
         if (wp == TIMER_LAYOUT) {
             restoreTopology();
             restoreWindows();
@@ -1401,6 +1453,15 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case ID_STARTUP: toggleStartup(); return 0;
         case ID_EXIT: DestroyWindow(hwnd); return 0;
+        case ID_GPU_APPLY:
+            // The profile first: a driver reset also drops the memory offset. XBAR after it has applied.
+            abRun(L"-Profile1");
+            SetTimer(hwnd, TIMER_XBAR, 6000, NULL);
+            return 0;
+        }
+        if (LOWORD(wp) >= ID_XBAR) {
+            if (LOWORD(wp) - ID_XBAR < xbarCount) setDword(L"Xbar", (DWORD)xbarSteps[LOWORD(wp) - ID_XBAR]), xbarApply();
+            return 0;
         }
         if (LOWORD(wp) >= ID_FAN_SLEEP) setDword(L"FanSleep", LOWORD(wp) - ID_FAN_SLEEP);
         else if (LOWORD(wp) >= ID_FAN_AWAKE) setDword(L"FanAwake", LOWORD(wp) - ID_FAN_AWAKE);
@@ -1528,6 +1589,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     ChangeWindowMessageFilterEx(hwnd, WM_TRAY, MSGFLT_ALLOW, NULL);
     ChangeWindowMessageFilterEx(hwnd, taskbarCreated, MSGFLT_ALLOW, NULL);
     if (linkLeds || hasCurve) SetTimer(hwnd, TIMER_LINK, 1000, NULL);
+    // Late enough for Afterburner to have started and applied its startup profile after logon.
+    if (hasXbar()) SetTimer(hwnd, TIMER_XBAR, 120000, NULL);
     hasRgb = hasOpenRgb || hasRam || linkLeds;
     if (hasRgb || hasFans || ddcIds[0]) displayNotify = RegisterPowerSettingNotification(hwnd, &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE);
     trim();
