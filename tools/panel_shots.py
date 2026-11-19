@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Render every panel view off-screen with `blackout.exe --panel-shot` and save PNGs.
+"""Render every panel state off-screen with `blackout.exe --panel-shot` and save PNGs.
 
-No window is ever shown, so this is safe to run at any time (run it from WSL or Git Bash on Windows).
+No window is ever shown and no hardware, blackout.ini or registry is touched, so this is safe to run at any time
+(run it from WSL or Git Bash on Windows; the exe has to sit on a Windows drive).
 
-  tools/panel_shots.py <blackout.exe> <out dir> [--readme]
+  tools/panel_shots.py <blackout.exe> <out dir> [--flat | --readme]
 
-Without --readme it writes every state plus sheet.png (a contact sheet for design review).
-With --readme it writes only docs-ready panel-main.png and panel-settings.png.
+Without options it writes every state as a transparent PNG plus sheet.png (a contact sheet for design review).
+--flat puts each PNG on a dark background, for viewers that show transparency as white.
+--readme writes only the docs/panel-*.png images.
 """
 import os
 import subprocess
@@ -14,85 +16,40 @@ import sys
 
 from PIL import Image, ImageDraw
 
+BACK = (58, 62, 66)
 STATES = {
-    "main": "",
-    "main-hover": "hover=2",
-    "main-rgb-off": "rgboff",
-    "main-curve-off": "curveoff",
-    "main-no-reading": "noread",
-    "main-at-max": "atcap",
-    "main-no-history": "nohist",
-    "main-override": "override",
-    "main-override-hot": "ovhot",
-    "main-override-curve-off": "override curveoff",
-    "main-no-fans": "nofans",
-    "main-light": "light",
-    "fans": "fans",
-    "fans-drag": "fans edited drag=1",
-    "fans-light": "fans light",
-    "fans-off": "fans notadmin",
-    "main-fans-broken": "notadmin",
-    "wake-no-fans": "wake nofans",
-    "wake": "wake",
-    "wake-on": "wake hotkey wakes",
-    "wake-light": "wake hotkey wakes light",
-    "system": "system",
-    "system-no-admin": "system notadmin",
-    "system-light": "system light",
-    "gpu": "gpu",
-    "gpu-light": "gpu light",
-    "gpu-view": "gpu profiles=3 view=2",
-    "gpu-view-light": "gpu profiles=3 view=2 light hover=32",
-    "gpu-hover-keep": "gpu profiles=3 hover=33",
-    "gpu-hover-xbar": "gpu profiles=3 light hover=31",
-    "gpu-new": "gpu profiles=2 view=3",
-    "gpu-armed": "gpu profiles=2 armed hover=33",
-    "gpu-busy": "gpu profiles=2 busy",
-    "gpu-reading": "gpu profiles=2 view=3 reading",
-    "gpu-naming": "gpu profiles=3 view=3 naming",
-    "gpu-hover-name": "gpu profiles=2 longname hover=35",
-    "main-gpu": "withgpu",
-    "main-gpu-light": "withgpu light hover=34",
-    "main-gpu-only": "withgpu nofans",
+    # Nothing set up: no blackout.ini, a fresh install.
+    "first-run": "nostart",
+    "first-run-light": "nostart light",
+    "first-run-rule-on": "hotkey hover=4",
+    "first-run-woken": "wakes=1",
+    # Lighting through OpenRGB only, the common setup.
+    "openrgb": "openrgb wakes=3",
+    "openrgb-rgb-off": "openrgb rgboff nosync nostart wakes=2",
+    # Everything set up.
+    "all": "all hotkey wakes=5",
+    "all-light": "all hotkey wakes=5 light",
+    "all-rule-off": "all noesc wakes=5",
+    "all-click-only": "all hotkey noesc wakes=4 hover=5",
+    "all-esc-only": "all hotkey noclick wakes=4 light hover=6",
+    "hover-screens": "all wakes=2 hover=1",
+    "hover-row": "all wakes=2 hover=2 light",
+    "hover-exit": "all wakes=2 hover=8",
     # Practical extremes: check every one for clipping, overlap and imbalance after a panel change.
-    "x-main-cold": "temp=99 names",
-    "x-main-hot": "temp=452 rpm=9990 longnames board",
-    "x-main-top": "top",
-    "x-main-why4": "fanwhy=4",
-    "x-main-gpu-long": "withgpu longname slot=2 gpustate=-104 what=1 fanwhy=4",
-    "x-main-gpu-xbar": "withgpu profiles=0 nofans",
-    "x-main-gpu-unsent": "withgpu profiles=1 noxbar unsent nofans",
-    "x-main-ov100": "withgpu profiles=2 override ovduty=100 temp=452 rpm=9990",
-    "x-main-ov20": "ovduty=20 light",
-    "x-fans-cap": "fans max=60 temp=452 edited",
-    "x-fans-ends": "fans max=30 hyst=0 withgpu",
-    "x-fans-ends-hi": "fans max=100 hyst=5 board light hover=12",
-    "x-fans-why4": "fans fanwhy=4",
-    "x-fans-why6": "fans fanwhy=6",
-    "x-wake-long": "wake hotkey longwakes",
-    "x-system-long": "system fanwhy=4 longstatus",
-    "x-system-why5": "system fanwhy=5 withgpu",
-    "x-system-board": "system board temp=452",
-    "x-gpu-long5": "gpu longname slot=2 mem=-1000 power=100",
-    "x-gpu-5named": "gpu fivenames",
-    "x-gpu-long5-view": "gpu longname slot=2 view=3 hover=28",
-    "x-gpu-3": "gpu profiles=3 longname slot=3 mem=0 power=104 xbar=0",
-    "x-gpu-2": "gpu profiles=2 longname slot=2 xbar=500",
-    "x-gpu-1": "gpu profiles=1 longname",
-    "x-gpu-wide": "gpu profiles=2 xbar=1000 mem=-1000 power=121 hover=30",
-    "x-gpu-0": "gpu profiles=0",
-    "x-gpu-0-noxbar": "gpu profiles=0 noxbar unsent",
-    "x-gpu-noxbar": "gpu profiles=2 noxbar",
-    "x-gpu-unsent": "gpu profiles=2 unsent nobase",
-    "x-gpu-mismatch": "gpu profiles=2 mismatch gpustate=-1000",
-    "x-gpu-refused": "gpu profiles=2 gpustate=-104 what=1",
-    "x-gpu-changed": "gpu profiles=2 gpustate=-1001",
-    "x-gpu-nodriver": "gpu profiles=2 gpustate=-2",
-    "x-gpu-xbar-refused": "gpu profiles=2 xbarstate=-104",
-    "x-gpu-notadmin": "gpu profiles=2 notadmin gpustate=-137",
-    "x-gpu-keptfail": "gpu profiles=2 keptfail",
+    "x-long-wakes": "all hotkey longwakes",
+    "x-long-wakes-light": "all hotkey longwakes light",
+    "x-long-ddc": "all longddc wakes=3",
+    "x-bad-path": "badpath wakes=2",
+    "x-broken": "badpath nohub wakes=2",
+    "x-broken-light": "badpath nohub ram longddc longwakes light",
+    "x-hub-only": "link",
+    "x-ram-only": "ram wakes=1",
+    "x-ddc-only": "ddc hotkey",
+    "x-top": "all hotkey wakes=5 top",
+    "x-scale-125": "all hotkey longwakes scale=125",
+    "x-scale-175": "all hotkey longwakes longddc scale=175",
 }
-README = {"panel-main": "withgpu profiles=2", "panel-settings": "fans withgpu", "panel-wake": "wake hotkey wakes withgpu", "panel-system": "system withgpu", "panel-gpu": "gpu profiles=2"}
+README = {"panel": "all hotkey wakes=3", "panel-first-run": "nostart", "panel-light": "openrgb wakes=2 light"}
 
 
 def winpath(path):
@@ -112,7 +69,6 @@ def shot(exe, flags, png):
     width = int.from_bytes(data[18:22], "little", signed=True)
     height = abs(int.from_bytes(data[22:26], "little", signed=True))
     img = Image.frombuffer("RGBa", (width, height), data[int.from_bytes(data[10:14], "little"):], "raw", "BGRa", 0, 1).convert("RGBA")
-    img.save(png)
     os.remove(bmp)
     return img
 
@@ -122,14 +78,21 @@ def main():
     os.makedirs(out, exist_ok=True)
     if "--readme" in sys.argv:
         for name, flags in README.items():
-            shot(exe, flags, os.path.join(out, name + ".png"))
+            shot(exe, flags, os.path.join(out, name + ".png")).save(os.path.join(out, name + ".png"))
             print(name)
         return
     images = [(name, shot(exe, flags, os.path.join(out, name + ".png"))) for name, flags in STATES.items()]
-    cols, cell_w = 8, 744 // 2 + 24
-    rows = (len(images) + cols - 1) // cols
+    for name, img in images:
+        if "--flat" in sys.argv:
+            flat = Image.new("RGB", (img.width + 48, img.height + 48), BACK)
+            flat.paste(img, (24, 24), img)
+            img = flat
+        img.save(os.path.join(out, name + ".png"))
+    cols = 7
+    cell_w = max(i.width for _, i in images) // 2 + 24
     cell_h = max(i.height for _, i in images) // 2 + 44
-    sheet = Image.new("RGB", (cols * cell_w + 24, rows * cell_h + 24), (58, 62, 66))
+    rows = (len(images) + cols - 1) // cols
+    sheet = Image.new("RGB", (cols * cell_w + 24, rows * cell_h + 24), BACK)
     draw = ImageDraw.Draw(sheet)
     for n, (name, img) in enumerate(images):
         x, y = 24 + (n % cols) * cell_w, 24 + (n // cols) * cell_h
