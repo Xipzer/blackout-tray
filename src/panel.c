@@ -300,19 +300,21 @@ static void toggleRow(LPCWSTR label, LPCWSTR hint, float x, float y, float w, in
     if (hint) text(hint, F_TINY, rc(x + INSET, y + 26, w - 80, 14), dim(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
     toggle(x + w - INSET - 40, y + 12, on, hover == id, enabled);
 }
-// One [-] or [+] of a stepper, 28 px square.
-static void stepButton(int id, float x, float y, BOOL plus, BOOL can, float a) {
-    D2D1_RECT_F r = rc(x, y, 28, 28);
-    if (can) hit[id] = r;
-    fillRound(r, 6, tone(), (!can ? 0.03f : hover == id ? 0.12f : 0.06f) * a);
-    line(x + 9, y + 14, x + 19, y + 14, ink(), (can ? 1 : 0.3f) * a, 1.5f);
-    if (plus) line(x + 14, y + 9, x + 14, y + 19, ink(), (can ? 1 : 0.3f) * a, 1.5f);
-}
-// [-] value [+] in a row at y, ending at right. a dims the whole control.
-static void stepper(LPCWSTR value, float right, float y, int down, int up, BOOL canDown, BOOL canUp, float a) {
-    stepButton(down, right - 108, y + 8, FALSE, canDown, a);
-    stepButton(up, right - 28, y + 8, TRUE, canUp, a);
-    text(value, F_BOLD, rc(right - 80, y + 13, 52, 18), ink(), a, DWRITE_TEXT_ALIGNMENT_CENTER);
+// A stepper's two buttons as one control, 28 px high: [ - | + ]. The value is never between them; it is shown with its
+// label, and this sits at the end of the row or under the chip. Each half is a target of at least 36 x 28.
+static void stepper(int down, int up, float x, float y, float w, BOOL canDown, BOOL canUp, float a) {
+    float half = w / 2;
+    fillRound(rc(x, y, w, 28), 6, tone(), 0.07f * a);
+    for (int i = 0; i < 2; i++) {
+        int id = i ? up : down;
+        BOOL can = i ? canUp : canDown;
+        float hx = x + i * half, cx = hx + half / 2;
+        if (can) hit[id] = rc(hx, y, half, 28);
+        if (can && hover == id) fillRound(rc(hx + 2, y + 2, half - 4, 24), 4, tone(), 0.10f * a);
+        line(cx - 5, y + 14, cx + 5, y + 14, ink(), (can ? 1 : 0.3f) * a, 1.5f);
+        if (i) line(cx, y + 9, cx, y + 19, ink(), (can ? 1 : 0.3f) * a, 1.5f);
+    }
+    line(x + half, y + 7, x + half, y + 21, tone(), 0.16f * a, 1);
 }
 // A button with a word on it, 28 px high. kind: 0 plain, 1 the main action of the view, 2 asks to confirm,
 // 3 quiet (small and dim: for what is rarely needed).
@@ -326,17 +328,30 @@ static void button(int id, LPCWSTR label, float x, float y, float w, int kind, B
     text(label, kind == 3 ? F_SMALL : F_BOLD, rc(x, y + (kind == 3 ? 6 : 5), w, 18), kind == 1 && can ? 0xFFFFFF : kind == 2 ? warn() : kind == 3 && !hot ? dim() : ink(),
          can ? 1 : 0.35f, DWRITE_TEXT_ALIGNMENT_CENTER);
 }
-// A reading: the value in bold over what it is. Fan speeds on Main, a profile's numbers on the GPU tab.
-static void chip(LPCWSTR value, LPCWSTR label, float x, float y, float w) {
+// A reading: the number with its unit small beside it, and what it is underneath. Fan speeds on Main, a profile's
+// numbers on the GPU tab. Numbers that are the point of a chip or a stepper row are set in F_BRAND, a size above
+// their labels, so the eye lands on the value first.
+static void chip(LPCWSTR value, LPCWSTR unit, LPCWSTR label, float x, float y, float w) {
+    float vw = measure(value, F_BRAND), uw = unit ? measure(unit, F_SMALL) + 3 : 0, at = x + (w - vw - uw) / 2;
     fillRound(rc(x, y, w, 44), 6, tone(), 0.06f);
-    text(value, F_BOLD, rc(x + 4, y + 5, w - 8, 18), ink(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+    if (vw + uw > w - 8) {
+        text(value, F_BRAND, rc(x + 4, y + 3, w - 8, 20), ink(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+    } else {
+        text(value, F_BRAND, rc(at, y + 3, vw + 2, 20), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (unit) text(unit, F_SMALL, rc(at + vw + 3, y + 7, uw, 16), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
     text(label, F_SMALL, rc(x + 4, y + 23, w - 8, 16), dim(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
 }
-// Label and hint on the left, [-] value [+] on the right.
-static void stepperRow(LPCWSTR label, LPCWSTR hint, LPCWSTR value, float x, float y, float w, int down, int up, BOOL canDown, BOOL canUp) {
-    text(label, F_ROW, rc(x + INSET, y + 6, w - 160, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    text(hint, F_TINY, rc(x + INSET, y + 26, w - 160, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    stepper(value, x + w - INSET, y, down, up, canDown, canUp, 1);
+// A setting that is stepped: label and hint on the left, then the value with its unit, then [ - | + ] at the end of
+// the row. One row holds one control. a dims the row.
+static void stepperRow(LPCWSTR label, LPCWSTR hint, LPCWSTR value, LPCWSTR unit, float x, float y, float w, int down, int up, BOOL canDown, BOOL canUp, float a) {
+    float px = x + w - INSET - 72, uw = measure(unit, F_SMALL), vw = measure(value, F_BRAND) + 2, vx = px - 12 - uw - 3 - vw;
+    float lw = vx - 10 - x - INSET;
+    text(label, F_ROW, rc(x + INSET, y + (hint ? 6 : 12), lw, 22), ink(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
+    if (hint) text(hint, F_TINY, rc(x + INSET, y + 26, lw, 14), dim(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
+    text(value, F_BRAND, rc(vx, y + 11, vw, 20), ink(), a, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    text(unit, F_SMALL, rc(px - 12 - uw, y + 15, uw + 2, 16), dim(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
+    stepper(down, up, px, y + 8, 72, canDown, canUp, a);
 }
 
 // ---- Layout ----
@@ -347,7 +362,7 @@ static int capped(int d) { return d > fanMax ? fanMax : d; }
 
 static float mainHeight(void) {
     float h = PAD + 32 + SECT + LABEL + 2 * ROW;
-    if (hasCurve) h += SECT + LABEL + INSET + 56 + GAP + 48 + GAP + 44 + INSET + 2 * ROW;
+    if (hasCurve) h += SECT + LABEL + INSET + 56 + GAP + 48 + GAP + 44 + INSET + 3 * ROW;
     else if (fanWhy >= 2) h += GAP + ROW; // notice: the fan curve is set up but can't run
     if (hasGpu()) h += SECT + LABEL + ROW;
     return h + PAD;
@@ -511,7 +526,7 @@ static void paintMain(float x, float y, float w) {
     y += SECT;
 
     section(L"COOLING", x, &y, w);
-    card(x, y, w, INSET + 56 + GAP + 48 + GAP + 44 + INSET + 2 * ROW);
+    card(x, y, w, INSET + 56 + GAP + 48 + GAP + 44 + INSET + 3 * ROW);
     float cy = y + INSET;
     // Two big readings on the left, the graph's range on the right.
     if (coolant < 0) lstrcpyW(s, L"--");
@@ -569,9 +584,7 @@ static void paintMain(float x, float y, float w) {
         else if (fanRpm[i] > 0 && fanRpm[i] < 1000) wsprintfW(rpm, L"%d", fanRpm[i]);
         else lstrcpyW(rpm, L"-");
         chainName(i, name);
-        wsprintfW(s, L"%s rpm", name);
-        // A long name keeps its own words: the number above it is plainly a speed.
-        chip(rpm, measure(s, F_SMALL) > cw - 8 ? name : s, ix + i * (cw + 8), cy, cw);
+        chip(rpm, rpm[0] == L'-' ? NULL : L"rpm", name, ix + i * (cw + 8), cy, cw);
     }
     cy += 44 + INSET;
     divider(x, cy, w);
@@ -579,19 +592,13 @@ static void paintMain(float x, float y, float w) {
     // Override: a fixed speed instead of the curve. Works while the curve is on; the speed can be set before switching on.
     cy += ROW;
     divider(x, cy, w);
-    float a = curveOn ? 1 : 0.4f, right = x + w - INSET - 40 - GAP;
-    if (curveOn) {
-        hit[H_OVR] = rc(x, cy, w, ROW);
-        hoverFill(H_OVR, hit[H_OVR]);
-    }
-    text(L"Override", F_ROW, rc(ix, cy + 6, right - 108 - ix - 8, 22), ink(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
-    text(ov == 2 ? L"Paused while hot" : L"Fixed fan speed", F_TINY, rc(ix, cy + 26, right - 108 - ix - 8, 14), ov == 2 ? warn() : dim(), a,
-         DWRITE_TEXT_ALIGNMENT_LEADING);
-    wsprintfW(s, L"%d%%", ovDuty);
-    stepper(s, right, cy, H_OVR_DN, H_OVR_UP, curveOn && ovDuty > 20, curveOn && ovDuty < 100, ovOn && curveOn ? 1 : 0.4f);
-    // A button at the end of the range still takes the click, so it never falls through to the switch.
-    if (curveOn) hit[H_OVR_DN] = rc(right - 108, cy + 8, 28, 28), hit[H_OVR_UP] = rc(right - 28, cy + 8, 28, 28);
-    toggle(x + w - INSET - 40, cy + 12, ovOn, hover == H_OVR, curveOn);
+    toggleRow(L"Override", ov == 2 ? L"" : L"A fixed speed instead of the curve", x, cy, w, H_OVR, ovOn, curveOn);
+    if (ov == 2) text(L"Paused while hot", F_TINY, rc(ix, cy + 26, iw - 80, 14), warn(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    // Its speed on a row of its own: one row, one control.
+    cy += ROW;
+    divider(x, cy, w);
+    wsprintfW(s, L"%d", ovDuty);
+    stepperRow(L"Override speed", NULL, s, L"%", x, cy, w, H_OVR_DN, H_OVR_UP, curveOn && ovDuty > 20, curveOn && ovDuty < 100, !curveOn ? 0.4f : ovOn ? 1 : 0.6f);
     paintMainGpu(x, cy + ROW + SECT, w);
 }
 
@@ -663,12 +670,12 @@ static void paintFans(float x, float y, float w) {
          rc(ix, cy, iw, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     cy += 18 + INSET;
     divider(x, cy, w);
-    wsprintfW(s, L"%d%%", fanMax);
-    stepperRow(L"Max fan speed", L"Upper limit for every fan", s, x, cy, w, H_MAX_DN, H_MAX_UP, fanMax > 30, fanMax < 100);
+    wsprintfW(s, L"%d", fanMax);
+    stepperRow(L"Max fan speed", L"Upper limit for every fan", s, L"%", x, cy, w, H_MAX_DN, H_MAX_UP, fanMax > 30, fanMax < 100, 1);
     cy += ROW;
     divider(x, cy, w);
-    wsprintfW(s, L"%d \x00B0" L"C", fanHyst);
-    stepperRow(L"Slow down after", srcDev ? L"It must be this much cooler first" : L"Water must be this much cooler first", s, x, cy, w, H_HYS_DN, H_HYS_UP, fanHyst > 0, fanHyst < 5);
+    wsprintfW(s, L"%d", fanHyst);
+    stepperRow(L"Slow down after", srcDev ? L"It must be this much cooler first" : L"Water must be this much cooler first", s, L"\x00B0" L"C", x, cy, w, H_HYS_DN, H_HYS_UP, fanHyst > 0, fanHyst < 5, 1);
     cy += ROW;
     divider(x, cy, w);
     BOOL edited = curveEdited();
@@ -878,9 +885,11 @@ static void paintGpu(float x, float y, float w) {
     if (keepArmed && !empty) button(H_GPU_KEEP, L"Replace it?", x + w - INSET - 106, y + 8, 106, 2, !gpuWait);
     else button(H_GPU_KEEP, L"Read from card", x + w - INSET - 106, y + 8, 106, empty ? 1 : 3, !gpuWait);
 
-    // The chips under the chart: the profile's power limit and memory offset, and the XBAR stepper.
+    // Under the chart: three equal chips (power limit, memory offset, XBAR offset), and under a chip that can be
+    // stepped its [ - | + ]. Today that is XBAR, with a note beside it on why only this one has buttons; the other
+    // two take the same control under their chips when they become adjustable.
     int chips = (empty ? 0 : 2) + (xbarCount > 0);
-    float chipsY = bottom - ROW - INSET - 44, xw = 132, pw3 = xbarCount ? 76 : (iw - 8) / 2, mw = xbarCount ? iw - 16 - xw - pw3 : pw3;
+    float cw = xbarCount ? (iw - 16) / 3 : (iw - 8) / 2, chipsY = bottom - ROW - INSET - 44 - (xbarCount ? 34 : 0);
     D2D1_RECT_F g = rc(ix + 30, y + 46, iw - 30 - 14, (chips ? chipsY - GAP : bottom - ROW - INSET) - 18 - (y + 46));
 
     // The curve: MHz over volts, this profile over the card's own curve. The scale follows what is drawn.
@@ -957,17 +966,17 @@ static void paintGpu(float x, float y, float w) {
     if (!empty) {
         if (viewPower) wsprintfW(s, L"%d", viewPower / 1000);
         else lstrcpyW(s, L"-");
-        chip(s, L"Power %", ix, chipsY, pw3);
+        chip(s, viewPower ? L"%" : NULL, L"Power limit", ix, chipsY, cw);
         wsprintfW(s, viewMemory > 0 ? L"+%d" : L"%d", viewMemory / 1000);
-        chip(s, L"Memory MHz", ix + pw3 + 8, chipsY, mw);
+        chip(s, L"MHz", L"Memory offset", ix + cw + 8, chipsY, cw);
     }
     if (xbarCount) {
-        // The XBAR stepper as a chip. It belongs to the card, not to a profile, and is sent a moment after the last step.
-        float cx = ix + iw - xw, mid = cx + xw / 2;
+        // XBAR belongs to the card, not to a profile, and is sent a moment after the last step.
+        float cx = ix + 2 * (cw + 8);
         wsprintfW(s, mhz ? L"+%d" : L"%d", mhz);
-        chip(s, L"XBAR MHz", cx, chipsY, xw);
-        stepButton(H_XBAR_DN, mid - 62, chipsY + 8, FALSE, at > 0 && !gpuWait, 1);
-        stepButton(H_XBAR_UP, mid + 34, chipsY + 8, TRUE, at < xbarCount - 1 && !gpuWait, 1);
+        chip(s, L"MHz", L"XBAR offset", cx, chipsY, cw);
+        stepper(H_XBAR_DN, H_XBAR_UP, cx, chipsY + 50, cw, at > 0 && !gpuWait, at < xbarCount - 1 && !gpuWait, 1);
+        if (gpuProfiles) text(L"XBAR is kept across profiles", F_TINY, rc(ix + 2, chipsY + 57, 2 * cw, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 
     // What the driver said last time, and the button that sends this profile.
@@ -1612,7 +1621,7 @@ static BOOL panelShow(HWND owner) {
 //   --panel-bench                      open and close five times, never shown; log time and memory to %TEMP%
 // Flags: fans wake system gpu | light top | x2 | nofans notadmin noread curveoff atcap nohist override ovhot | hotkey wakes edited rgboff
 //        hover=<id> drag=<point> shade=<percent> grey=<percent>
-// Extremes: temp=<C x10> rpm=<n> max=<percent> names longnames board fanwhy=<2..6> longstatus longwakes
+// Extremes: temp=<C x10> rpm=<n> max=<percent> hyst=<C> ovduty=<percent> names longnames board fanwhy=<2..6> longstatus longwakes
 //           profiles=<0..5> slot=<n> longname power=<percent> mem=<MHz> xbar=<MHz> noxbar unsent nobase mismatch
 //           gpustate=<code> what=<0..2> xbarstate=<code> view=<n> busy reading armed keptfail naming | withgpu scale=<percent>
 
@@ -1712,7 +1721,8 @@ static int panelDev(LPWSTR cmd) {
     setPref(L"HotkeyMode", flag(cmd, L"hotkey")), setPref(L"WakeClick", 1), setPref(L"WakeEsc", 1), setPref(L"Edited", flag(cmd, L"edited"));
     coolant = flag(cmd, L"noread") ? -1 : (at = wcsstr(cmd, L"temp=")) ? _wtoi(at + 5) / 10.0 : wcsstr(cmd, L"--panel-shot") ? 28.6 : getDword(L"Coolant", 286) / 10.0;
     curveOn = !flag(cmd, L"curveoff");
-    ovOn = flag(cmd, L"override") || flag(cmd, L"ovhot"), ovDuty = 60;
+    ovOn = flag(cmd, L"override") || flag(cmd, L"ovhot"), ovDuty = (at = wcsstr(cmd, L"ovduty=")) ? _wtoi(at + 7) : 60;
+    if ((at = wcsstr(cmd, L"hyst="))) fanHyst = _wtoi(at + 5);
     if (hasCurve && coolant >= 0 && flag(cmd, L"ovhot")) {
         double top = 0;
         curvePeak(&top);
