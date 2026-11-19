@@ -49,7 +49,7 @@ STATES = {
     "x-scale-125": "all hotkey longwakes scale=125",
     "x-scale-175": "all hotkey longwakes longddc scale=175",
 }
-README = {"panel": "all hotkey wakes=3", "panel-first-run": "nostart", "panel-light": "openrgb wakes=2 light"}
+README = {"panel": "all hotkey wakes=3", "panel-first-run": "nostart", "panel-light": "openrgb hotkey wakes=2 light"}
 
 
 def winpath(path):
