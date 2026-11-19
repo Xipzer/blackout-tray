@@ -36,10 +36,11 @@
 
 enum {
     H_NONE, H_SCREENS, H_GEAR, H_BACK, H_TAB_FANS, H_TAB_WAKE, H_TAB_SYSTEM, H_RGB, H_SYNC, H_CURVE, H_START, H_EXIT,
-    H_MAX_DN, H_MAX_UP, H_HYS_DN, H_HYS_UP, H_RESET, H_HOTKEY, H_WAKE_CLICK, H_WAKE_ESC, H_NOTICE, H_OVR_DN, H_OVR_UP, H_OVR, H_COUNT
+    H_MAX_DN, H_MAX_UP, H_HYS_DN, H_HYS_UP, H_RESET, H_HOTKEY, H_WAKE_CLICK, H_WAKE_ESC, H_NOTICE, H_OVR_DN, H_OVR_UP, H_OVR,
+    H_TAB_GPU, H_PROF_DN, H_PROF_UP, H_XBAR_DN, H_XBAR_UP, H_GPU_APPLY, H_COUNT
 };
 enum { F_BRAND, F_ROW, F_SMALL, F_BIG, F_UNIT, F_BOLD, F_TINY, F_COUNT };
-enum { V_MAIN, V_FANS, V_WAKE, V_SYSTEM };
+enum { V_MAIN, V_FANS, V_WAKE, V_SYSTEM, V_GPU };
 
 static const GUID IID_D2DFactory = {0x06152247, 0x6f50, 0x465a, {0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07}};
 static const GUID IID_DWFactory = {0xb859ee5a, 0xd838, 0x4b5b, {0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48}};
@@ -61,13 +62,13 @@ static IDWriteTextFormat *fmt[F_COUNT];
 static HWND panelOwner;
 static float panelScale = 1, panelH;
 static D2D1_RECT_F hit[H_COUNT];
-static int hover, dragPoint = -1, view = V_MAIN, settingsTab = V_FANS, tabs[3], tabCount;
+static int hover, dragPoint = -1, view = V_MAIN, settingsTab = V_FANS, tabs[4], tabCount;
 static BOOL dockTop, panelLight, panelTest, panelHidden, dirty;
 static DWORD panelClosedAt;
 static D2D1_RECT_F chart;
 static const float tMin = 25, tMax = 50;
 // Preview values for --panel-test / --panel-shot, so screenshots don't depend on the machine's settings.
-static struct { LPCWSTR name; DWORD value; } fake[12];
+static struct { LPCWSTR name; DWORD value; } fake[16];
 static int fakeCount;
 
 static DWORD pref(LPCWSTR name, DWORD fallback) {
@@ -85,7 +86,7 @@ static void setPref(LPCWSTR name, DWORD v) {
             fake[i].value = v;
             return;
         }
-    if (fakeCount < 12) fake[fakeCount].name = name, fake[fakeCount++].value = v;
+    if (fakeCount < 16) fake[fakeCount].name = name, fake[fakeCount++].value = v;
 }
 
 // ---- Drawing primitives ----
@@ -364,23 +365,24 @@ static void paintHeader(float x, float y, float w) {
     }
 }
 
-// The Fans tab is only offered when a fan curve is configured (working or not).
+// The Fans tab is only offered when a fan curve is configured (working or not), the GPU tab when [gpu] sets it up.
 static void tabsBuild(void) {
     BOOL found = FALSE;
     tabCount = 0;
     if (fanWhy != 1) tabs[tabCount++] = V_FANS;
     tabs[tabCount++] = V_WAKE;
+    if (hasXbar()) tabs[tabCount++] = V_GPU;
     tabs[tabCount++] = V_SYSTEM;
     for (int i = 0; i < tabCount; i++) found |= tabs[i] == settingsTab;
     if (!found) settingsTab = tabs[0];
 }
 
 static void paintTabs(float x, float y, float w) {
-    static const LPCWSTR names[3] = {L"Fans", L"Wake", L"System"};
+    static const LPCWSTR names[4] = {L"Fans", L"Wake", L"System", L"GPU"};
     float sw = (w - 6) / tabCount;
     fillRound(rc(x, y, w, 32), 8, tone(), 0.06f);
     for (int i = 0; i < tabCount; i++) {
-        int id = H_TAB_FANS + tabs[i] - V_FANS;
+        int id = tabs[i] == V_GPU ? H_TAB_GPU : H_TAB_FANS + tabs[i] - V_FANS;
         BOOL on = view == tabs[i];
         D2D1_RECT_F r = rc(x + 3 + i * sw, y + 3, sw, 26);
         hit[id] = rc(r.left, y, sw, 32);
@@ -646,6 +648,47 @@ static void paintSystem(float x, float y, float w) {
          DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
+// Afterburner keeps the clock curve, power limit and memory offset in its profiles, but not the XBAR offset, and
+// nothing here can be read back from the card: the tab says what was sent, not what the card is doing.
+static void paintGpu(float x, float y, float w) {
+    WCHAR s[96];
+    float ix = x + INSET, iw = w - 2 * INSET;
+    int rows = gpuProfiles >= 2 ? 3 : 2, at = 0, slot = (int)pref(L"GpuProfile", 1), mhz = (int)pref(L"Xbar", (DWORD)xbarDefault);
+    for (int i = 0; i < xbarCount; i++)
+        if (xbarSteps[i] == mhz) at = i;
+    card(x, y, w, rows * ROW);
+    if (gpuProfiles >= 2) {
+        wsprintfW(s, L"%d", slot);
+        stepperRow(L"Afterburner profile", L"Loaded now and after a driver reset", s, x, y, w, H_PROF_DN, H_PROF_UP, slot > 1, slot < gpuProfiles);
+        y += ROW;
+        divider(x, y, w);
+    }
+    if (mhz) wsprintfW(s, L"+%d", mhz);
+    else lstrcpyW(s, L"Off");
+    stepperRow(L"XBAR offset", L"Crossbar clock, in MHz", s, x, y, w, H_XBAR_DN, H_XBAR_UP, at > 0, at < xbarCount - 1);
+    y += ROW;
+    divider(x, y, w);
+    hit[H_GPU_APPLY] = rc(x, y, w, ROW);
+    hoverFill(H_GPU_APPLY, hit[H_GPU_APPLY]);
+    text(L"Re-apply now", F_ROW, rc(ix, y + 6, iw, 22), ACCENT, 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    text(L"Profile, then XBAR. For after a driver reset", F_TINY, rc(ix, y + 26, iw, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    y += ROW + 10;
+    text(L"Afterburner profiles can't hold the XBAR offset, and a driver", F_SMALL, rc(x + 2, y, w, 16), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    text(L"reset or restart drops it. Blackout sends it again at startup.", F_SMALL, rc(x + 2, y + 17, w, 16), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    y += 34 + 14;
+
+    section(L"STATUS", x, &y, w);
+    card(x, y, w, 3 * 28 + 8);
+    y += 4;
+    BOOL found = panelTest || GetFileAttributesW(abPath) != INVALID_FILE_ATTRIBUTES, admin = panelTest ? pref(L"Admin", 1) : isElevated();
+    statusRow(L"Afterburner", found ? L"Found" : L"Not found at the path in blackout.ini", found ? 2 : 1, x, y, w);
+    if (xbarSent > 0) wsprintfW(s, L"+%d MHz at %02d:%02d", xbarSent, xbarSentAt.wHour, xbarSentAt.wMinute);
+    else if (!xbarSent) wsprintfW(s, L"Off at %02d:%02d", xbarSentAt.wHour, xbarSentAt.wMinute);
+    else lstrcpyW(s, L"Not yet, 2 minutes after startup");
+    statusRow(L"XBAR sent", s, xbarSent >= 0 ? 2 : 0, x, y + 28, w);
+    statusRow(L"Admin rights", admin ? L"Yes" : L"No, so Afterburner can't be driven", admin ? 2 : 1, x, y + 56, w);
+}
+
 static void paintPanel(void) {
     float x = PAD, w = PANEL_W - 2 * PAD, y = PAD;
     D2D1_COLOR_F clear = {0, 0, 0, 0};
@@ -707,6 +750,7 @@ static void paintPanel(void) {
     y += GAP + 32 + GAP;
     if (view == V_FANS) paintFans(x, y, w);
     else if (view == V_WAKE) paintWake(x, y, w);
+    else if (view == V_GPU) paintGpu(x, y, w);
     else paintSystem(x, y, w);
 }
 
@@ -895,6 +939,28 @@ static void panelClick(int id) {
     case H_TAB_FANS:
     case H_TAB_WAKE:
     case H_TAB_SYSTEM: panelGo(V_FANS + id - H_TAB_FANS); return;
+    case H_TAB_GPU: panelGo(V_GPU); return;
+    case H_PROF_DN:
+    case H_PROF_UP: {
+        // Applied a moment after the last click, so stepping past a slot doesn't load it.
+        int slot = (int)pref(L"GpuProfile", 1) + (id == H_PROF_UP ? 1 : -1);
+        setPref(L"GpuProfile", slot < 1 ? 1 : slot > gpuProfiles ? gpuProfiles : slot);
+        if (!panelTest) SetTimer(panelOwner, TIMER_GPU, 700, NULL);
+        break;
+    }
+    case H_XBAR_DN:
+    case H_XBAR_UP: {
+        int at = 0, mhz = (int)pref(L"Xbar", (DWORD)xbarDefault);
+        for (int i = 0; i < xbarCount; i++)
+            if (xbarSteps[i] == mhz) at = i;
+        at += id == H_XBAR_UP ? 1 : -1;
+        setPref(L"Xbar", xbarSteps[at < 0 ? 0 : at >= xbarCount ? xbarCount - 1 : at]);
+        if (!panelTest) SetTimer(panelOwner, TIMER_XBAR, 700, NULL);
+        break;
+    }
+    case H_GPU_APPLY:
+        if (!panelTest) SendMessageW(panelOwner, WM_COMMAND, ID_GPU_APPLY, 0);
+        break;
     case H_RGB:
         if (panelTest) setPref(L"RgbOn", !pref(L"RgbOn", 1));
         else rgbToggle(panelOwner);
@@ -1302,8 +1368,17 @@ static int panelDev(LPWSTR cmd) {
     if ((at = wcsstr(cmd, L"grey="))) grey = _wtoi(at + 5);
     if ((at = wcsstr(cmd, L"hover="))) hover = _wtoi(at + 6);
     if ((at = wcsstr(cmd, L"drag="))) dragPoint = _wtoi(at + 5);
+    if (flag(cmd, L"gpu")) {
+        // Preview: a card with two profiles and four XBAR steps, +400 sent at 09:15.
+        lstrcpyW(abPath, L"MSIAfterburner.exe");
+        xbarCount = 4, xbarSteps[0] = 0, xbarSteps[1] = 300, xbarSteps[2] = 400, xbarSteps[3] = 500, xbarDefault = 400, gpuProfiles = 2;
+        setPref(L"Xbar", 400), setPref(L"GpuProfile", 1);
+        xbarSent = 400, xbarSentAt.wHour = 9, xbarSentAt.wMinute = 15;
+    } else {
+        abPath[0] = 0; // screenshots of the other tabs don't depend on this machine's blackout.ini
+    }
     tabsBuild();
-    int to = flag(cmd, L"fans") ? V_FANS : flag(cmd, L"wake") ? V_WAKE : flag(cmd, L"system") ? V_SYSTEM : V_MAIN;
+    int to = flag(cmd, L"fans") ? V_FANS : flag(cmd, L"wake") ? V_WAKE : flag(cmd, L"system") ? V_SYSTEM : flag(cmd, L"gpu") ? V_GPU : V_MAIN;
     if (wcsstr(cmd, L"--panel-bench")) {
         panelBench();
         return 0;
