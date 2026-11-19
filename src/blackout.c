@@ -392,7 +392,8 @@ static void wakeWatch(HWND hwnd, BOOL on) {
 }
 
 static void wakeRecord(void) {
-    WCHAR path[256], name[48] = L"", icon = 0, *kind = L"No input: Windows or an app";
+    WCHAR path[256], name[48] = L"", icon = 0;
+    LPCWSTR kind = L"No input: Windows or an app";
     UINT n = 256;
     BOOL slip = FALSE;
     if (hotkeyCause) {
