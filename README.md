@@ -23,6 +23,7 @@ This works for a Blackout click and for Windows' own display timeout.
 <p>
 <img src="docs/panel-wake.png" width="280" alt="Wake settings">
 <img src="docs/panel-system.png" width="280" alt="System and status">
+<img src="docs/panel-gpu.png" width="280" alt="GPU tab: Afterburner profile and XBAR offset">
 </p>
 
 - **Main:** Screens off, RGB, turn RGB off with the screens. With a fan curve: the temperature, fan speed, a 15 minute graph, RPM per fan, the curve on/off switch and the override.
@@ -119,7 +120,8 @@ The same tab lists the last few wakes and the device behind each one (for exampl
 | | `hysteresis` | C the temperature must drop before fans slow down (default 2) |
 | `[gpu]` | `cap_cold`, `cap_warm` | Optional NVIDIA clock cap in MHz that follows the coolant (see below). Both 0 (default) = off |
 | | `cold_below`, `warm_above` | Coolant C: the cold cap applies below `cold_below` (default 30), the warm cap above `warm_above` (default 32) |
-| | `afterburner`, `xbar`, `xbar_default` | Optional XBAR offset menu (see below): Afterburner path, offsets in MHz offered in the menu (e.g. `0,300,400,500`), and the offset used until one is picked |
+| | `afterburner`, `xbar`, `xbar_default` | Optional GPU tab (see below): Afterburner path, XBAR offsets in MHz to step through (e.g. `0,300,400,500`), and the offset used until one is picked |
+| | `profiles` | How many Afterburner profile slots the GPU tab offers (2 to 5). 0 (default) hides the row and profile 1 is used |
 
 Fan speeds and toggles are set from the tray menu and kept in `HKCU\Software\Blackout`.
 
@@ -131,15 +133,18 @@ For an overclocked NVIDIA card on the same water loop. A cold GPU core gets extr
 With `[gpu] cap_cold` and `cap_warm` set, Blackout sends `nvidia-smi -lgc 210,<cap>` when the coolant crosses the thresholds, and again every minute, because a driver reset drops the cap.
 It needs Blackout to run as admin. Leave both at 0 if you do not need it.
 
-## XBAR offset (optional)
+## GPU tab (optional)
 
-MSI Afterburner 4.6.7 Beta 5 added an "out of warranty" mode that can offset the crossbar (XBAR) clock on NVIDIA cards, but only from its command line (`/wpXBARCLK_off,N`). Afterburner profiles can't store it, and a driver reset or reboot drops it.
-With `[gpu] afterburner` and `xbar` set, the tray menu gets a **GPU** submenu:
+MSI Afterburner 4.6.7 Beta 5 added an "out of warranty" mode that can offset the crossbar (XBAR) clock on NVIDIA cards, but only from its command line (`/wpXBARCLK_off,N`). Afterburner profiles can't store it, and a driver reset or restart drops it.
+With `[gpu] afterburner` and `xbar` set, the panel's Settings get a **GPU** tab:
 
-- **XBAR offset**: pick one of the `xbar` steps. Blackout sends it at once and keeps the choice in `HKCU\Software\Blackout\Xbar`.
-- **Re-apply profile 1 and XBAR**: after a driver reset, which also drops the memory offset. Runs `MSIAfterburner.exe -Profile1`, then the XBAR write.
+- **Afterburner profile** (with `profiles=2` or more): step to a slot and Blackout loads it (`MSIAfterburner.exe -ProfileN`). Kept in `HKCU\Software\Blackout\GpuProfile`.
+- **XBAR offset**: step through the `xbar` values. Blackout sends the write a moment after the last click and keeps the choice in `HKCU\Software\Blackout\Xbar`.
+- **Re-apply now**: loads the profile, then sends XBAR 6 seconds later. For after a driver reset, which also drops the clock curve and the memory offset.
 
-Blackout also sends the saved offset 2 minutes after it starts, once Afterburner has applied its startup profile. It needs Blackout to run as admin and Afterburner's out-of-warranty mode switched on.
+Blackout also sends the saved offset 2 minutes after it starts, once Afterburner has applied its startup profile.
+The tab shows what was sent and when. It can't read the offset back from the card, so check the crossbar clock in Afterburner's monitoring if in doubt.
+It needs Blackout to run as admin and Afterburner's out-of-warranty mode switched on.
 
 ## FURY module (optional)
 

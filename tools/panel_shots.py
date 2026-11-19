@@ -39,8 +39,10 @@ STATES = {
     "system": "system",
     "system-no-admin": "system notadmin",
     "system-light": "system light",
+    "gpu": "gpu",
+    "gpu-light": "gpu light",
 }
-README = {"panel-main": "", "panel-settings": "fans", "panel-wake": "wake hotkey wakes", "panel-system": "system"}
+README = {"panel-main": "", "panel-settings": "fans", "panel-wake": "wake hotkey wakes", "panel-system": "system", "panel-gpu": "gpu"}
 
 
 def winpath(path):

@@ -33,6 +33,7 @@
 #define TIMER_IDLE   5
 #define TIMER_ICON   6
 #define TIMER_XBAR   7
+#define TIMER_GPU    8
 #define MAX_LINK_LEDS 160
 #define MAX_WINDOWS  256
 #define MAX_CURVE    8
@@ -73,10 +74,12 @@ static double coolant = -1;
 static int gpuCapCold, gpuCapWarm, gpuColdBelow = 30, gpuWarmAbove = 32, gpuCapNow, gpuCapAge;
 // [gpu] XBAR (crossbar clock) offset through MSI Afterburner's out-of-warranty command line (/wpXBARCLK_off,N). It
 // can't be stored in an Afterburner profile and a driver reset drops it, so the choice lives in HKCU Xbar and is
-// re-sent at startup and from the menu. afterburner= empty or xbar= empty hides the GPU menu.
+// re-sent at startup and from the panel's GPU tab. afterburner= empty or xbar= empty hides the tab. profiles=N also
+// offers Afterburner profile slots 1..N there (HKCU GpuProfile), loaded on change and by "Re-apply now".
 #define MAX_XBAR 8
 static WCHAR abPath[MAX_PATH];
-static int xbarSteps[MAX_XBAR], xbarCount, xbarDefault;
+static int xbarSteps[MAX_XBAR], xbarCount, xbarDefault, gpuProfiles, xbarSent = -1;
+static SYSTEMTIME xbarSentAt;
 // Coolant history for the panel graph: 15 min at one sample per 4 s tick, C x100.
 #define HISTORY 225
 static short history[HISTORY];
@@ -309,6 +312,8 @@ static void loadConfig(void) {
         if (v >= 0 && v <= 1000) xbarSteps[xbarCount++] = v;
     }
     xbarDefault = GetPrivateProfileIntW(L"gpu", L"xbar_default", xbarCount ? xbarSteps[xbarCount - 1] : 0, iniPath);
+    gpuProfiles = GetPrivateProfileIntW(L"gpu", L"profiles", 0, iniPath);
+    if (gpuProfiles < 0 || gpuProfiles > 5) gpuProfiles = 0;
 }
 
 static BOOL hasXbar(void) {
@@ -324,8 +329,19 @@ static void abRun(LPCWSTR args) {
 
 static void xbarApply(void) {
     WCHAR args[40];
-    wsprintfW(args, L"/wpXBARCLK_off,%d", (int)getDword(L"Xbar", (DWORD)xbarDefault));
+    xbarSent = (int)getDword(L"Xbar", (DWORD)xbarDefault);
+    GetLocalTime(&xbarSentAt);
+    wsprintfW(args, L"/wpXBARCLK_off,%d", xbarSent);
     abRun(args);
+}
+
+// The profile first: a driver reset also drops the clock curve and the memory offset. XBAR once it has applied.
+static void gpuApply(HWND hwnd) {
+    WCHAR args[16];
+    DWORD slot = getDword(L"GpuProfile", 1);
+    wsprintfW(args, L"-Profile%d", slot >= 1 && slot <= 5 ? (int)slot : 1);
+    abRun(args);
+    SetTimer(hwnd, TIMER_XBAR, 6000, NULL);
 }
 
 // Corsair Commander Pro over raw HID: report [0, 0x23, channel, duty%] sets a fixed duty (liquidctl's protocol).
@@ -1267,7 +1283,7 @@ static void showMenu(HWND hwnd) {
             AppendMenuW(gpu, MF_STRING | (x == (DWORD)xbarSteps[i] ? MF_CHECKED : 0), ID_XBAR + i, label);
         }
         AppendMenuW(gpu, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(gpu, MF_STRING, ID_GPU_APPLY, L"Re-apply profile 1 and XBAR");
+        AppendMenuW(gpu, MF_STRING, ID_GPU_APPLY, L"Re-apply profile and XBAR");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)gpu, L"GPU");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
@@ -1404,6 +1420,11 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (wp == TIMER_XBAR) {
             xbarApply();
+            panelUpdate();
+            return 0;
+        }
+        if (wp == TIMER_GPU) {
+            gpuApply(hwnd);
             return 0;
         }
         if (wp == TIMER_LAYOUT) {
@@ -1453,11 +1474,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case ID_STARTUP: toggleStartup(); return 0;
         case ID_EXIT: DestroyWindow(hwnd); return 0;
-        case ID_GPU_APPLY:
-            // The profile first: a driver reset also drops the memory offset. XBAR after it has applied.
-            abRun(L"-Profile1");
-            SetTimer(hwnd, TIMER_XBAR, 6000, NULL);
-            return 0;
+        case ID_GPU_APPLY: gpuApply(hwnd); return 0;
         }
         if (LOWORD(wp) >= ID_XBAR) {
             if (LOWORD(wp) - ID_XBAR < xbarCount) setDword(L"Xbar", (DWORD)xbarSteps[LOWORD(wp) - ID_XBAR]), xbarApply();
