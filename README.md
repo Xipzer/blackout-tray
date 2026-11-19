@@ -119,6 +119,7 @@ The same tab lists the last few wakes and the device behind each one (for exampl
 | | `hysteresis` | C the temperature must drop before fans slow down (default 2) |
 | `[gpu]` | `cap_cold`, `cap_warm` | Optional NVIDIA clock cap in MHz that follows the coolant (see below). Both 0 (default) = off |
 | | `cold_below`, `warm_above` | Coolant C: the cold cap applies below `cold_below` (default 30), the warm cap above `warm_above` (default 32) |
+| | `afterburner`, `xbar`, `xbar_default` | Optional XBAR offset menu (see below): Afterburner path, offsets in MHz offered in the menu (e.g. `0,300,400,500`), and the offset used until one is picked |
 
 Fan speeds and toggles are set from the tray menu and kept in `HKCU\Software\Blackout`.
 
@@ -129,6 +130,16 @@ To find a monitor's hardware ID: Device Manager > Monitors > Properties > Detail
 For an overclocked NVIDIA card on the same water loop. A cold GPU core gets extra boost bins from the driver, and an overclocked curve may not survive them.
 With `[gpu] cap_cold` and `cap_warm` set, Blackout sends `nvidia-smi -lgc 210,<cap>` when the coolant crosses the thresholds, and again every minute, because a driver reset drops the cap.
 It needs Blackout to run as admin. Leave both at 0 if you do not need it.
+
+## XBAR offset (optional)
+
+MSI Afterburner 4.6.7 Beta 5 added an "out of warranty" mode that can offset the crossbar (XBAR) clock on NVIDIA cards, but only from its command line (`/wpXBARCLK_off,N`). Afterburner profiles can't store it, and a driver reset or reboot drops it.
+With `[gpu] afterburner` and `xbar` set, the tray menu gets a **GPU** submenu:
+
+- **XBAR offset**: pick one of the `xbar` steps. Blackout sends it at once and keeps the choice in `HKCU\Software\Blackout\Xbar`.
+- **Re-apply profile 1 and XBAR**: after a driver reset, which also drops the memory offset. Runs `MSIAfterburner.exe -Profile1`, then the XBAR write.
+
+Blackout also sends the saved offset 2 minutes after it starts, once Afterburner has applied its startup profile. It needs Blackout to run as admin and Afterburner's out-of-warranty mode switched on.
 
 ## FURY module (optional)
 
