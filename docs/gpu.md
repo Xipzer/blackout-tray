@@ -73,7 +73,7 @@ Rules that cost us time:
 
 - Read, change, write back. A zeroed buffer is silently ignored.
 - On this card 127 of the 128 used slots are core points. The last one belongs to memory.
-- A memory offset set by Afterburner does not show in the memory read above; it sits in the curve table's memory slots. `--gpu-save` takes the larger of the two.
+- A memory offset set by Afterburner did not show in the memory read above (it read 0 at +3000). Two non-core slots of the curve table held offsets instead, which is our guess at where it lives. `--gpu-save` takes the larger reading.
 - Error -137 means the process is not elevated.
 
 ## Sources
