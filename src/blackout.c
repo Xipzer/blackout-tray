@@ -149,7 +149,7 @@ static void loadConfig(void) {
     CharUpperW(ddcIds);
     ddcOff = GetPrivateProfileIntW(L"ddc", L"off", 4, iniPath);
     linkLeds = GetPrivateProfileIntW(L"link", L"leds", 0, iniPath);
-    if (linkLeds > MAX_LINK_LEDS) linkLeds = MAX_LINK_LEDS;
+    linkLeds = linkLeds < 0 ? 0 : linkLeds > MAX_LINK_LEDS ? MAX_LINK_LEDS : linkLeds;
 }
 
 // Opens the first HID interface matching both substrings (lowercase), e.g. the iCUE LINK hub's MI_00.
@@ -174,7 +174,7 @@ static HANDLE openHid(LPCWSTR id, LPCWSTR iface, DWORD flags) {
 
 // iCUE LINK hub protocol (from OpenRGB's CorsairICueLinkController): 513-byte reports [0, 0, 1, cmd..., data...],
 // each answered by one 513-byte input report. The hub drops back to its stored hardware lighting ~5 s after the last
-// colour frame, so Blackout re-sends the frame every few seconds. Each tick is four tiny HID transactions.
+// colour frame, so Blackout re-sends the frame every 4 s. Each tick is five small HID exchanges.
 static HANDLE ioEvent;
 
 // One HID exchange with 1 s timeouts: send a report (if any), then read one (if wanted).
@@ -202,8 +202,7 @@ static BOOL linkIo(BYTE *out, BYTE *in) { return hidIo(link, out, 513, in, 513);
 
 // Windows gives every open handle a copy of each input report. When another program (HWiNFO, iCUE) talks to the hub,
 // its replies queue up on our handle too, and every later read would take a stale reply and stay out of step. So each
-// session starts with an empty queue, and a reply that is not the one asked for drops the handle (a new one starts
-// in step).
+// frame starts with an empty queue, and a failed exchange drops the handle (a new one starts in step).
 static void linkSync(void) { HidD_FlushQueue(link); }
 
 static BOOL linkCmd(const BYTE *cmd, int cmdLen, const BYTE *data, int dataLen) {
@@ -234,7 +233,9 @@ static BOOL linkColor(BYTE r, BYTE g, BYTE b) {
     return ok;
 }
 
+// Only with [link] leds= set: a hub that is not set up is never opened.
 static BOOL linkRefresh(void) {
+    if (!linkLeds) return FALSE;
     return linkOk = litOn ? linkColor(color[0], color[1], color[2]) : linkColor(0, 0, 0);
 }
 

@@ -3,8 +3,10 @@
 //
 // Cost model: the panel exists only while it is open. d2d1.dll and dwrite.dll are loaded on open and freed on close.
 // Drawing is done on the CPU (software DC render target) into a 32-bit bitmap that is handed to a layered window.
-// A GPU target took 90 to 400 ms and 60 to 70 MB because it loads the graphics driver into the process. Measured
-// with --panel-bench.
+// A GPU target took 90 to 400 ms and 60 to 70 MB because it loads the graphics driver into the process.
+// No text is measured: the first text layout DirectWrite builds costs about 7 MB, which plain DrawText does not. So
+// nothing is placed by the width of a string. The few places that need one (a value after its label, the pills) use
+// widths written down here, which Segoe UI Variable and Segoe UI (Windows 10) share. Measured with --panel-bench.
 //
 // Look: docked flush to the taskbar and the screen edge, square on those sides, one rounded corner facing the desktop,
 // and filled with the taskbar's own colour (sampled when it opens) so it reads as part of the same surface.
@@ -123,15 +125,6 @@ static void text(LPCWSTR s, int f, D2D1_RECT_F r, UINT rgb, float a, DWRITE_TEXT
     paint(rgb, a);
     ID2D1RenderTarget_DrawText(rt, s, lstrlenW(s), fmt[f], &r, (ID2D1Brush *)brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
 }
-static float measure(LPCWSTR s, int f) {
-    IDWriteTextLayout *l;
-    DWRITE_TEXT_METRICS m = {0};
-    IDWriteTextFormat_SetTextAlignment(fmt[f], DWRITE_TEXT_ALIGNMENT_LEADING);
-    if (IDWriteFactory_CreateTextLayout(dwf, s, lstrlenW(s), fmt[f], 1000, 100, &l) != S_OK) return 0;
-    IDWriteTextLayout_GetMetrics(l, &m);
-    IDWriteTextLayout_Release(l);
-    return m.widthIncludingTrailingWhitespace;
-}
 
 // ---- Icons ----
 
@@ -210,9 +203,9 @@ static void toggleRow(LPCWSTR label, float x, float y, float w, int id, BOOL on)
 }
 // One of the inputs that may wake the screens, as a pill with its picture, 28 px high. Chosen is a red outline and a
 // red tint, not solid red: that is kept for Screens off, the one action here. While the rule above it is off the pill
-// is grey and not a target, but still shows the choice. Returns its width.
-static float pill(int id, LPCWSTR label, float x, float y, BOOL on, BOOL live) {
-    float tw = measure(label, F_SMALL), w = 36 + tw + 14, a = live ? 1 : 0.45f;
+// is grey and not a target, but still shows the choice.
+static void pill(int id, LPCWSTR label, float x, float y, float w, BOOL on, BOOL live) {
+    float a = live ? 1 : 0.45f;
     D2D1_RECT_F r = rc(x, y, w, 28), edge = rc(x + 0.5f, y + 0.5f, w - 1, 27);
     UINT c = on ? ink() : dim();
     if (live) hit[id] = r;
@@ -225,49 +218,48 @@ static float pill(int id, LPCWSTR label, float x, float y, BOOL on, BOOL live) {
     }
     if (id == H_WAKE_CLICK) mouseIcon(x + 19, y + 14, c, a);
     else keyboardIcon(x + 20, y + 14, c, a);
-    text(label, F_SMALL, rc(x + 36, y + 6, tw + 2, 16), c, a, DWRITE_TEXT_ALIGNMENT_LEADING);
-    return w;
+    text(label, F_SMALL, rc(x + 36, y + 6, w - 40, 16), c, a, DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
 // ---- Layout ----
 
 // What Blackout drives on this PC. Only parts that are set up are listed, so with nothing set up nothing is shown.
-// A part has one way to fail, and then its value says which.
-typedef struct { LPCWSTR label, value; BOOL bad; } Part;
+// A part has one way to fail, and then its value says which. at: where the value starts, after the dot and the name.
+// wide: the value is long (a fault, several monitors), so the part gets a line to itself.
+typedef struct { LPCWSTR label, value; float at; BOOL bad, wide; } Part;
 static int partsList(Part *p) {
     static WCHAR leds[16];
     int n = 0;
-    if (openrgb[0]) p[n++] = (Part){L"OpenRGB", hasOpenRgb ? L"" : L"not found at the path in blackout.ini", !hasOpenRgb};
+    if (openrgb[0]) p[n++] = (Part){L"OpenRGB", hasOpenRgb ? L"" : L"not found at the path in blackout.ini", 67, !hasOpenRgb, !hasOpenRgb};
     if (linkLeds) {
         wsprintfW(leds, L"%d LEDs", linkLeds);
-        p[n++] = (Part){L"iCUE LINK", linkOk ? leds : L"hub not answering", !linkOk};
+        p[n++] = (Part){L"iCUE LINK", linkOk ? leds : L"hub not answering", 68, !linkOk, !linkOk};
     }
-    if (hasRam) p[n++] = (Part){L"FURY RAM", L"", FALSE};
-    if (ddcIds[0]) p[n++] = (Part){L"Monitor power", ddcIds, FALSE};
+    if (hasRam) p[n++] = (Part){L"FURY RAM", L"", 0, FALSE, FALSE};
+    if (ddcIds[0]) p[n++] = (Part){L"Monitor power", ddcIds, 94, FALSE, wcschr(ddcIds, L',') != NULL};
     return n;
 }
-// The parts flow like words and wrap: a dot, the name, and what the dot cannot say. Returns the height used, and
-// only measures when draw is not set.
-static float partsFlow(float x, float y, float w, BOOL draw) {
+// The parts, two to a line: a dot, the name, and what the dot cannot say. Returns the height used, and only counts
+// lines when draw is not set.
+static float partsGrid(float x, float y, float w, BOOL draw) {
     Part p[4];
-    int n = partsList(p);
-    float cx = x, cy = y;
+    int n = partsList(p), col = 0, lines = 0;
     for (int i = 0; i < n; i++) {
-        float lw = measure(p[i].label, F_SMALL), vw = p[i].value[0] ? measure(p[i].value, F_SMALL) + 5 : 0;
-        if (cx > x && cx + 12 + lw + vw > x + w) cx = x, cy += LINE;
-        if (12 + lw + vw > w) vw = w - 12 - lw; // a part longer than a line ends in an ellipsis
+        if (p[i].wide && col) col = 0, lines++;
+        float cx = x + col * w / 2, cy = y + lines * LINE, cw = p[i].wide ? w : w / 2 - (col ? 0 : 8);
         if (draw) {
             dot(cx + 4, cy + 11, 3.5f, p[i].bad ? warn() : good(), 1);
-            text(p[i].label, F_SMALL, rc(cx + 12, cy + 3, lw + 2, 16), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-            if (vw) text(p[i].value, F_SMALL, rc(cx + 17 + lw, cy + 3, vw - 3, 16), p[i].bad ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+            text(p[i].label, F_SMALL, rc(cx + 12, cy + 3, cw - 12, 16), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+            if (p[i].value[0]) text(p[i].value, F_SMALL, rc(cx + p[i].at, cy + 3, cw - p[i].at, 16), p[i].bad ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
         }
-        cx += 12 + lw + vw + 16;
+        if (p[i].wide || col) col = 0, lines++;
+        else col = 1;
     }
-    return n ? cy - y + LINE : 0;
+    return (lines + col) * LINE;
 }
 static float logHeight(void) { return wakeCount ? LABEL + wakeCount * LOG + 6 : 0; }
 static float partsHeight(void) {
-    float h = partsFlow(0, 0, PANEL_W - 2 * PAD - 4, FALSE);
+    float h = partsGrid(0, 0, 0, FALSE);
     return h ? h + 4 : 0;
 }
 static float panelHeight(void) {
@@ -332,7 +324,7 @@ static void paintBackground(void) {
 // the part that gets cut off.
 static void paintLog(float x, float y, float w) {
     WCHAR at[8];
-    float tw = measure(L"not blocked", F_TINY) + 8;
+    const float tw = 64; // "not blocked" and the gap before it
     text(L"WHAT WOKE THE SCREENS", F_TINY, rc(x, y + 9, w, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     y += LABEL;
     for (int i = 0; i < wakeCount; i++, y += LOG) {
@@ -370,13 +362,13 @@ static void paintPanel(void) {
 
     // The title starts a sentence that the row under it finishes, so no line divides them: wake the screens only with
     // a left-click, with Esc, and (always, so it is words and not a pill) with Ctrl+Alt+Del.
-    float lh = logHeight(), aw = measure(L"always", F_SMALL), cw = measure(L"Ctrl+Alt+Del", F_SMALL), a = hotkeyOn ? 1 : 0.45f;
+    float lh = logHeight(), a = hotkeyOn ? 1 : 0.45f;
     card(x, y, w, 2 * ROW + lh);
     toggleRow(L"Wake the screens only with", x, y, w, H_HOTKEY, hotkeyOn);
-    float px = ix + pill(H_WAKE_CLICK, L"Left-click", ix, y + ROW + 2, wakeClick, hotkeyOn) + 8;
-    pill(H_WAKE_ESC, L"Esc", px, y + ROW + 2, wakeEsc, hotkeyOn);
-    text(L"Ctrl+Alt+Del", F_SMALL, rc(ix + iw - aw - 5 - cw, y + ROW + 8, cw + 2, 16), ink(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
-    text(L"always", F_SMALL, rc(ix + iw - aw, y + ROW + 8, aw + 2, 16), dim(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
+    pill(H_WAKE_CLICK, L"Left-click", ix, y + ROW + 2, 96, wakeClick, hotkeyOn);
+    pill(H_WAKE_ESC, L"Esc", ix + 104, y + ROW + 2, 66, wakeEsc, hotkeyOn);
+    text(L"Ctrl+Alt+Del", F_SMALL, rc(ix + 178, y + ROW + 8, iw - 178 - 38, 16), ink(), a, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    text(L"always", F_SMALL, rc(ix + iw - 40, y + ROW + 8, 40, 16), dim(), a, DWRITE_TEXT_ALIGNMENT_TRAILING);
     if (lh) {
         divider(x, y + 2 * ROW, w);
         paintLog(ix, y + 2 * ROW, iw);
@@ -388,7 +380,7 @@ static void paintPanel(void) {
     y += ROW + 10;
 
     // The foot of the panel is about Blackout itself: what it drives on this PC, its version, and the way out.
-    partsFlow(x + 2, y, w - 4, TRUE);
+    partsGrid(x + 2, y, w - 4, TRUE);
     y += partsHeight();
     text(L"Blackout " VERSION, F_TINY, rc(x + 2, y + 7, 160, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     hit[H_EXIT] = rc(x + w - 56, y, 56, 28);
