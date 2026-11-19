@@ -9,7 +9,10 @@
 // Look: docked flush to the taskbar and the screen edge, square on those sides, one rounded corner facing the desktop,
 // and filled with the taskbar's own colour (sampled when it opens) so it reads as part of the same surface.
 //
-// Views: Main (screens off, lighting, live cooling) and Settings with three tabs (Fans, Wake, System).
+// Views: Main (screens off, lighting, live cooling, the GPU profile) and Settings with tabs Fans, Wake, GPU, System.
+//
+// Type: the big numerals (F_BIG) are for live readings only. Settings are drawn as charts and chips. Red (ACCENT) means
+// "on": a switch that is on, the profile that is on the card, the one main action of a view.
 #define COBJMACROS
 #include <d2d1.h>
 #include <dwrite.h>
@@ -20,8 +23,7 @@
 #define PANEL_CLASS L"BlackoutPanel"
 #define VERSION     L"1.1.0"
 #define PANEL_W     372.0f
-#define SET_H       476.0f // every Settings tab has this height, so the tabs never move under the cursor
-#define CHART_H     142.0f
+#define SET_H       520.0f // every Settings tab has this height, so the tabs never move under the cursor
 #define PAD         16.0f
 #define INSET       14.0f
 #define GAP         12.0f
@@ -37,7 +39,7 @@
 enum {
     H_NONE, H_SCREENS, H_GEAR, H_BACK, H_TAB_FANS, H_TAB_WAKE, H_TAB_SYSTEM, H_RGB, H_SYNC, H_CURVE, H_START, H_EXIT,
     H_MAX_DN, H_MAX_UP, H_HYS_DN, H_HYS_UP, H_RESET, H_HOTKEY, H_WAKE_CLICK, H_WAKE_ESC, H_NOTICE, H_OVR_DN, H_OVR_UP, H_OVR,
-    H_TAB_GPU, H_PROF1, H_PROF2, H_PROF3, H_PROF4, H_PROF5, H_XBAR_DN, H_XBAR_UP, H_GPU_APPLY, H_COUNT
+    H_TAB_GPU, H_PROF1, H_PROF2, H_PROF3, H_PROF4, H_PROF5, H_XBAR_DN, H_XBAR_UP, H_GPU_APPLY, H_GPU_KEEP, H_GPU, H_GPU_NAME, H_COUNT
 };
 enum { F_BRAND, F_ROW, F_SMALL, F_BIG, F_UNIT, F_BOLD, F_TINY, F_COUNT };
 enum { V_MAIN, V_FANS, V_WAKE, V_SYSTEM, V_GPU };
@@ -63,7 +65,7 @@ static HWND panelOwner;
 static float panelScale = 1, panelH;
 static D2D1_RECT_F hit[H_COUNT];
 static int hover, dragPoint = -1, view = V_MAIN, settingsTab = V_FANS, tabs[4], tabCount;
-static BOOL dockTop, panelLight, panelTest, panelHidden, dirty;
+static BOOL dockTop, panelLight, panelTest, panelHidden, dirty, gpuTab;
 static DWORD panelClosedAt;
 static D2D1_RECT_F chart;
 static const float tMin = 25, tMax = 50;
@@ -240,6 +242,24 @@ static void chevronLeft(float cx, float cy, UINT rgb) {
     line(cx + 3, cy - 6, cx - 3, cy, rgb, 1, 2);
     line(cx - 3, cy, cx + 3, cy + 6, rgb, 1, 2);
 }
+// Marks a row that opens something.
+static void pencil(float cx, float cy, UINT rgb, float a) {
+    line(cx - 2.5f, cy + 2.5f, cx + 3.5f, cy - 3.5f, rgb, a, 2.4f);
+    line(cx - 5, cy + 5, cx - 3.4f, cy + 3.4f, rgb, a, 1.2f);
+}
+static void chevronRight(float cx, float cy) {
+    line(cx - 2, cy - 4.5f, cx + 2.5f, cy, dim(), 0.8f, 1.5f);
+    line(cx + 2.5f, cy, cx - 2, cy + 4.5f, dim(), 0.8f, 1.5f);
+}
+static void mouseIcon(float cx, float cy, UINT rgb, float a) {
+    strokeRound(rc(cx - 4.5f, cy - 7, 9, 14), 4.5f, rgb, a, 1.3f);
+    line(cx, cy - 4.5f, cx, cy - 1.5f, rgb, a, 1.3f);
+}
+static void keyboardIcon(float cx, float cy, UINT rgb, float a) {
+    strokeRound(rc(cx - 8, cy - 5.5f, 16, 11), 2.5f, rgb, a, 1.3f);
+    for (int i = -1; i <= 1; i++) dot(cx + i * 4, cy - 1.5f, 0.9f, rgb, a);
+    line(cx - 3.5f, cy + 2, cx + 3.5f, cy + 2, rgb, a, 1.3f);
+}
 
 // ---- Controls ----
 
@@ -280,20 +300,37 @@ static void toggleRow(LPCWSTR label, LPCWSTR hint, float x, float y, float w, in
     if (hint) text(hint, F_TINY, rc(x + INSET, y + 26, w - 80, 14), dim(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
     toggle(x + w - INSET - 40, y + 12, on, hover == id, enabled);
 }
+// One [-] or [+] of a stepper, 28 px square.
+static void stepButton(int id, float x, float y, BOOL plus, BOOL can, float a) {
+    D2D1_RECT_F r = rc(x, y, 28, 28);
+    if (can) hit[id] = r;
+    fillRound(r, 6, tone(), (!can ? 0.03f : hover == id ? 0.12f : 0.06f) * a);
+    line(x + 9, y + 14, x + 19, y + 14, ink(), (can ? 1 : 0.3f) * a, 1.5f);
+    if (plus) line(x + 14, y + 9, x + 14, y + 19, ink(), (can ? 1 : 0.3f) * a, 1.5f);
+}
 // [-] value [+] in a row at y, ending at right. a dims the whole control.
 static void stepper(LPCWSTR value, float right, float y, int down, int up, BOOL canDown, BOOL canUp, float a) {
-    float bx = right - 28;
-    for (int i = 0; i < 2; i++) {
-        int id = i ? up : down;
-        BOOL can = i ? canUp : canDown;
-        D2D1_RECT_F r = rc(i ? bx : bx - 28 - 52, y + 8, 28, 28);
-        float cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2;
-        if (can) hit[id] = r;
-        fillRound(r, 6, tone(), (!can ? 0.03f : hover == id ? 0.12f : 0.06f) * a);
-        line(cx - 5, cy, cx + 5, cy, ink(), (can ? 1 : 0.3f) * a, 1.5f);
-        if (i) line(cx, cy - 5, cx, cy + 5, ink(), (can ? 1 : 0.3f) * a, 1.5f);
-    }
-    text(value, F_BOLD, rc(bx - 52, y + 13, 52, 18), ink(), a, DWRITE_TEXT_ALIGNMENT_CENTER);
+    stepButton(down, right - 108, y + 8, FALSE, canDown, a);
+    stepButton(up, right - 28, y + 8, TRUE, canUp, a);
+    text(value, F_BOLD, rc(right - 80, y + 13, 52, 18), ink(), a, DWRITE_TEXT_ALIGNMENT_CENTER);
+}
+// A button with a word on it, 28 px high. kind: 0 plain, 1 the main action of the view, 2 asks to confirm,
+// 3 quiet (small and dim: for what is rarely needed).
+static void button(int id, LPCWSTR label, float x, float y, float w, int kind, BOOL can) {
+    D2D1_RECT_F r = rc(x, y, w, 28);
+    BOOL hot = can && hover == id;
+    if (can) hit[id] = r;
+    if (kind == 1 && can) fillRound(r, 6, ACCENT, hot ? 0.85f : 1);
+    else if (kind == 2) fillRound(r, 6, warn(), hot ? 0.3f : 0.2f);
+    else fillRound(r, 6, tone(), !can ? 0.03f : hot ? 0.12f : kind == 3 ? 0.04f : 0.06f);
+    text(label, kind == 3 ? F_SMALL : F_BOLD, rc(x, y + (kind == 3 ? 6 : 5), w, 18), kind == 1 && can ? 0xFFFFFF : kind == 2 ? warn() : kind == 3 && !hot ? dim() : ink(),
+         can ? 1 : 0.35f, DWRITE_TEXT_ALIGNMENT_CENTER);
+}
+// A reading: the value in bold over what it is. Fan speeds on Main, a profile's numbers on the GPU tab.
+static void chip(LPCWSTR value, LPCWSTR label, float x, float y, float w) {
+    fillRound(rc(x, y, w, 44), 6, tone(), 0.06f);
+    text(value, F_BOLD, rc(x + 4, y + 5, w - 8, 18), ink(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+    text(label, F_SMALL, rc(x + 4, y + 23, w - 8, 16), dim(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 // Label and hint on the left, [-] value [+] on the right.
 static void stepperRow(LPCWSTR label, LPCWSTR hint, LPCWSTR value, float x, float y, float w, int down, int up, BOOL canDown, BOOL canUp) {
@@ -312,6 +349,7 @@ static float mainHeight(void) {
     float h = PAD + 32 + SECT + LABEL + 2 * ROW;
     if (hasCurve) h += SECT + LABEL + INSET + 56 + GAP + 48 + GAP + 44 + INSET + 2 * ROW;
     else if (fanWhy >= 2) h += GAP + ROW; // notice: the fan curve is set up but can't run
+    if (hasGpu()) h += SECT + LABEL + ROW;
     return h + PAD;
 }
 static float viewHeight(void) { return view == V_MAIN ? mainHeight() : SET_H; }
@@ -339,7 +377,7 @@ static BOOL curveEdited(void) {
 
 static LPCWSTR fanWhyText(void) {
     static const LPCWSTR why[] = {L"", L"Not set up: add [fans] to blackout.ini", L"Needs Blackout to run as admin", L"PawnIO or LpcIO.bin is missing",
-                                  L"No known fan chip found: run blackout.exe --devices", L"A fan or sensor in blackout.ini was not found",
+                                  L"No known fan chip found: run blackout.exe --devices", L"Fan or sensor not found: check blackout.ini",
                                   L"Untested hardware: set untested=1 to use it"};
     return why[fanWhy < 0 || fanWhy > 6 ? 0 : fanWhy];
 }
@@ -365,13 +403,14 @@ static void paintHeader(float x, float y, float w) {
     }
 }
 
-// The Fans tab is only offered when a fan curve is configured (working or not), the GPU tab when [gpu] sets it up.
+// The Fans tab is only offered when a fan curve is configured (working or not), the GPU tab when [gpu] sets it up
+// or the PC has an NVIDIA driver (so the first profile can be made here).
 static void tabsBuild(void) {
     BOOL found = FALSE;
     tabCount = 0;
     if (fanWhy != 1) tabs[tabCount++] = V_FANS;
     tabs[tabCount++] = V_WAKE;
-    if (hasGpu()) tabs[tabCount++] = V_GPU;
+    if (gpuTab) tabs[tabCount++] = V_GPU;
     tabs[tabCount++] = V_SYSTEM;
     for (int i = 0; i < tabCount; i++) found |= tabs[i] == settingsTab;
     if (!found) settingsTab = tabs[0];
@@ -392,6 +431,58 @@ static void paintTabs(float x, float y, float w) {
     }
 }
 
+// What the card has been told. 2 = applied, 1 = refused or not possible (why says it), 0 = nothing sent yet.
+static int gpuStatus(LPWSTR title, LPWSTR why) {
+    why[0] = 0;
+    if (!(panelTest ? pref(L"Admin", 1) : isElevated())) {
+        lstrcpyW(title, L"Needs admin rights"), lstrcpyW(why, L"Run Blackout as admin to send this");
+    } else if (gpuState == -2 || (gpuProfiles && gpuState && gpuState != -1)) {
+        lstrcpyW(title, L"Not applied"), lstrcpyW(why, gpuNote);
+    } else if (xbarCount && xbarState && xbarState != -1) {
+        lstrcpyW(title, L"Not applied"), wsprintfW(why, L"XBAR refused (%d)", xbarState);
+    } else if (gpuProfiles ? gpuState == -1 : xbarState == -1) {
+        lstrcpyW(title, L"Not sent yet");
+        return 0;
+    } else {
+        if (gpuProfiles) lstrcpyW(title, gpuNote);
+        else wsprintfW(title, L"XBAR applied at %02d:%02d", xbarSentAt.wHour, xbarSentAt.wMinute);
+        return 2;
+    }
+    return 1;
+}
+
+// The profile that is sent to the card (1 to gpuProfiles), 0 when there is none.
+static int gpuActive(void) {
+    int slot = (int)pref(L"GpuProfile", 1);
+    return !gpuProfiles ? 0 : slot < 1 || slot > gpuProfiles ? 1 : slot;
+}
+
+// Main: which profile is on the card and whether the driver took it. From memory only; a click opens the GPU tab.
+static void paintMainGpu(float x, float y, float w) {
+    WCHAR s[64], why[64];
+    float ix = x + INSET, right = x + w - INSET - 16;
+    int slot = gpuActive(), mhz = (int)pref(L"Xbar", (DWORD)xbarDefault);
+    if (!hasGpu()) return;
+    section(L"GPU", x, &y, w);
+    card(x, y, w, ROW);
+    hit[H_GPU] = rc(x, y, w, ROW);
+    hoverFill(H_GPU, hit[H_GPU]);
+    int state = gpuWait ? 0 : gpuStatus(s, why);
+    dot(ix + 4, y + 22, 3.5f, state == 2 ? GOOD : state == 1 ? warn() : dim(), state ? 1 : 0.5f);
+    text(gpuWait ? L"Sending..." : state == 1 && why[0] ? why : s, F_TINY, rc(ix + 16, y + 26, right - ix - 16 - 70, 14), state == 1 ? warn() : dim(), 1,
+         DWRITE_TEXT_ALIGNMENT_LEADING);
+    if (slot && gpuNames[slot][0]) lstrcpyW(s, gpuNames[slot]);
+    else if (slot) wsprintfW(s, L"Profile %d", slot);
+    else lstrcpyW(s, L"XBAR offset");
+    text(s, F_ROW, rc(ix + 16, y + 6, right - ix - 16 - (slot && xbarCount ? 70 : 0), 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    if (xbarCount) {
+        wsprintfW(s, mhz ? L"+%d MHz" : L"%d MHz", mhz);
+        text(s, F_SMALL, rc(right - 80, y + (slot ? 8 : 13), 80, 18), ink(), 0.85f, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        if (slot) text(L"XBAR", F_TINY, rc(right - 80, y + 26, 80, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+    chevronRight(x + w - INSET - 4, y + 22);
+}
+
 static void paintMain(float x, float y, float w) {
     WCHAR s[96];
     float ix = x + INSET, iw = w - 2 * INSET;
@@ -400,19 +491,24 @@ static void paintMain(float x, float y, float w) {
     toggleRow(L"RGB", NULL, x, y, w, H_RGB, panelTest ? pref(L"RgbOn", 1) : rgbShown(), TRUE);
     divider(x, y + ROW, w);
     toggleRow(L"Turn off with screens", NULL, x, y + ROW, w, H_SYNC, pref(L"Sync", 1), TRUE);
+    y += 2 * ROW;
     if (!hasCurve) {
-        if (fanWhy < 2) return;
-        // Set up but not running: say so where it will be seen. Click for details.
-        y += 2 * ROW + GAP;
-        card(x, y, w, ROW);
-        hit[H_NOTICE] = rc(x, y, w, ROW);
-        hoverFill(H_NOTICE, hit[H_NOTICE]);
-        dot(ix + 4, y + 22, 3.5f, warn(), 1);
-        text(L"Fan curve is off", F_ROW, rc(ix + 16, y + 6, iw - 16, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        text(fanWhyText(), F_TINY, rc(ix + 16, y + 26, iw - 16, 14), warn(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (fanWhy >= 2) {
+            // Set up but not running: say so where it will be seen. Click for details.
+            y += GAP;
+            card(x, y, w, ROW);
+            hit[H_NOTICE] = rc(x, y, w, ROW);
+            hoverFill(H_NOTICE, hit[H_NOTICE]);
+            dot(ix + 4, y + 22, 3.5f, warn(), 1);
+            text(L"Fan curve is off", F_ROW, rc(ix + 16, y + 6, iw - 36, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+            text(fanWhyText(), F_TINY, rc(ix + 16, y + 26, iw - 36, 14), warn(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+            chevronRight(x + w - INSET - 4, y + 22);
+            y += ROW;
+        }
+        paintMainGpu(x, y + SECT, w);
         return;
     }
-    y += 2 * ROW + SECT;
+    y += SECT;
 
     section(L"COOLING", x, &y, w);
     card(x, y, w, INSET + 56 + GAP + 48 + GAP + 44 + INSET + 2 * ROW);
@@ -468,16 +564,14 @@ static void paintMain(float x, float y, float w) {
     int chips = outCount < 3 ? outCount : 3;
     float cw = chips ? (iw - (chips - 1) * 8) / chips : iw;
     for (int i = 0; i < chips; i++) {
-        WCHAR name[32];
-        float cxp = ix + i * (cw + 8);
-        fillRound(rc(cxp, cy, cw, 44), 6, tone(), 0.06f);
-        if (fanRpm[i] >= 1000 && fanRpm[i] < 10000) wsprintfW(s, L"%d,%03d", fanRpm[i] / 1000, fanRpm[i] % 1000);
-        else if (fanRpm[i] > 0 && fanRpm[i] < 1000) wsprintfW(s, L"%d", fanRpm[i]);
-        else lstrcpyW(s, L"-");
-        text(s, F_BOLD, rc(cxp, cy + 5, cw, 18), ink(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+        WCHAR name[32], rpm[16];
+        if (fanRpm[i] >= 1000 && fanRpm[i] < 10000) wsprintfW(rpm, L"%d,%03d", fanRpm[i] / 1000, fanRpm[i] % 1000);
+        else if (fanRpm[i] > 0 && fanRpm[i] < 1000) wsprintfW(rpm, L"%d", fanRpm[i]);
+        else lstrcpyW(rpm, L"-");
         chainName(i, name);
         wsprintfW(s, L"%s rpm", name);
-        text(s, F_SMALL, rc(cxp, cy + 23, cw, 16), dim(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+        // A long name keeps its own words: the number above it is plainly a speed.
+        chip(rpm, measure(s, F_SMALL) > cw - 8 ? name : s, ix + i * (cw + 8), cy, cw);
     }
     cy += 44 + INSET;
     divider(x, cy, w);
@@ -498,22 +592,26 @@ static void paintMain(float x, float y, float w) {
     // A button at the end of the range still takes the click, so it never falls through to the switch.
     if (curveOn) hit[H_OVR_DN] = rc(right - 108, cy + 8, 28, 28), hit[H_OVR_UP] = rc(right - 28, cy + 8, 28, 28);
     toggle(x + w - INSET - 40, cy + 12, ovOn, hover == H_OVR, curveOn);
+    paintMainGpu(x, cy + ROW + SECT, w);
 }
 
 static void paintFans(float x, float y, float w) {
     WCHAR s[96];
     float ix = x + INSET, iw = w - 2 * INSET;
-    if (!hasCurve) {
-        card(x, y, w, 118);
-        text(L"The fan curve is off", F_ROW, rc(ix, y + 14, iw, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        text(fanWhyText(), F_SMALL, rc(ix, y + 38, iw, 18), warn(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        text(L"It sets fan speeds from a water or board temperature.", F_SMALL, rc(ix, y + 66, iw, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        text(L"Setup: README, section Fan curve.", F_SMALL, rc(ix, y + 86, iw, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        return;
+    BOOL off = !hasCurve;
+    if (off) {
+        // Why it is not running, then the curve that is set up, drawn grey: it is there, it is just not driving anything.
+        card(x, y, w, 62);
+        dot(ix + 4, y + 23, 3.5f, warn(), 1);
+        text(L"The fan curve is off", F_ROW, rc(ix + 16, y + 12, iw - 16, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        text(fanWhyText(), F_SMALL, rc(ix + 16, y + 34, iw - 16, 18), warn(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        y += 62 + GAP;
     }
-    card(x, y, w, INSET + 6 + CHART_H + 18 + GAP + 18 + INSET + 3 * ROW);
+    // One card to the bottom of the tab; the chart takes what the rows below it leave.
+    float ch = panelH - PAD - y - (INSET + 6 + 18 + GAP + 18 + INSET + (off ? 0 : 3 * ROW));
+    card(x, y, w, panelH - PAD - y);
     float cy = y + INSET;
-    chart = rc(ix + 34, cy + 6, iw - 34 - 8, CHART_H);
+    chart = rc(ix + 34, cy + 6, iw - 34 - 8, ch);
     for (int d = 0; d <= 100; d += 25) line(chart.left, chartY((float)d), chart.right, chartY((float)d), tone(), 0.07f, 1);
     for (int t = 25; t <= 50; t += 5) {
         line(chartX((float)t), chart.top, chartX((float)t), chart.bottom, tone(), 0.07f, 1);
@@ -534,7 +632,12 @@ static void paintFans(float x, float y, float w) {
     p[n++] = pt(chart.left, chartY((float)curveAt(tMin)));
     for (int i = 0; i < curveN; i++) p[n++] = pt(chartX((float)curveT[i]), chartY((float)capped(curveD[i])));
     p[n++] = pt(chart.right, chartY((float)curveAt(tMax)));
-    geometry(p, n, FALSE, 0, ACCENT, 1, 2.5f);
+    geometry(p, n, FALSE, 0, off ? dim() : ACCENT, off ? 0.7f : 1, 2.5f);
+    cy = chart.bottom + 18 + GAP;
+    if (off) {
+        text(L"The curve that is set up. Help: README, Fan curve.", F_SMALL, rc(ix, cy, iw, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        return;
+    }
     // Where the water is now.
     if (coolant >= tMin && coolant <= tMax) {
         dashed(chartX((float)coolant), chart.top, chartX((float)coolant), chart.bottom, tone(), 0.4f);
@@ -556,7 +659,6 @@ static void paintFans(float x, float y, float w) {
         fillRound(rc(tx, ty, tw, 22), 11, panelLight ? 0x1B1B1F : 0xF3F3F3, 0.96f);
         text(s, F_SMALL, rc(tx, ty + 3, tw, 18), panelLight ? 0xF3F3F3 : 0x1B1B1F, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
-    cy = chart.bottom + 18 + GAP;
     text(curveN < MAX_CURVE ? L"Drag a point. Double-click adds one, right-click removes it." : L"Drag a point. Right-click removes it.", F_SMALL,
          rc(ix, cy, iw, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     cy += 18 + INSET;
@@ -594,7 +696,7 @@ static void paintWake(float x, float y, float w) {
     y += 16 + 14;
 
     section(L"WHAT WOKE THE SCREENS", x, &y, w);
-    float h = SET_H - PAD - y;
+    float h = panelH - PAD - y;
     card(x, y, w, h);
     if (!wakeCount) {
         text(L"Nothing yet", F_ROW, rc(ix, y + h / 2 - 22, iw, 22), ink(), 0.7f, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -607,18 +709,37 @@ static void paintWake(float x, float y, float w) {
         if (i) divider(ix, ry, iw);
         wsprintfW(s, L"%02d:%02d", wakes[i].at.wHour, wakes[i].at.wMinute);
         text(s, F_BOLD, rc(ix, ry + rh / 2 - 9, 44, 18), ink(), i ? 0.7f : 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        text(wakes[i].cause, F_SMALL, rc(ix + 48, ry + rh / 2 - 8, iw - 48, 18), i ? dim() : ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        // The cause as a picture: what kind of input, the device's name, and the bracketed remark set apart on the
+        // right ("not blocked" is the one that matters, so it must never be the part that gets cut off).
+        WCHAR *name = s, *tag;
+        float cy = ry + rh / 2, tw = 0;
+        lstrcpyW(s, wakes[i].cause);
+        if ((tag = wcsstr(s, L" ("))) {
+            *tag = 0, tag += 2;
+            if (tag[0] && tag[lstrlenW(tag) - 1] == L')') tag[lstrlenW(tag) - 1] = 0;
+            BOOL slip = tag[0] == L'n'; // "not blocked": input got past Hotkey mode
+            tw = measure(tag, F_TINY) + 8;
+            text(tag, F_TINY, rc(ix + iw - tw, cy - 7, tw, 14), slip ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        }
+        if (s[0] == L'M' || s[0] == L'L') mouseIcon(ix + 56, cy, i ? dim() : ink(), 1);
+        else if (s[0] == L'K' || s[0] == L'E') keyboardIcon(ix + 56, cy, i ? dim() : ink(), 1);
+        else ring(ix + 56, cy, 4, dim(), 0.7f, 1.3f);
+        if (!wcsncmp(s, L"Mouse: ", 7)) name += 7;
+        else if (!wcsncmp(s, L"Keyboard: ", 10)) name += 10;
+        text(name, F_SMALL, rc(ix + 72, cy - 8, iw - 72 - tw, 18), i ? dim() : ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 }
 
+// The value takes all the room the label leaves, and ends in an ellipsis if even that is not enough.
 static void statusRow(LPCWSTR label, LPCWSTR value, int state, float x, float y, float w) {
+    float lw = measure(label, F_SMALL) + 16 + 12;
     dot(x + INSET + 4, y + 14, 3.5f, state == 2 ? GOOD : state == 1 ? warn() : dim(), state ? 1 : 0.5f);
     text(label, F_SMALL, rc(x + INSET + 16, y + 6, 120, 18), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    text(value, F_SMALL, rc(x + INSET + 120, y + 6, w - 2 * INSET - 120, 18), state == 1 ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    text(value, F_SMALL, rc(x + INSET + lw, y + 6, w - 2 * INSET - lw, 18), state == 1 ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
 }
 
 static void paintSystem(float x, float y, float w) {
-    WCHAR s[96];
+    WCHAR s[96], why[64];
     float ix = x + INSET, iw = w - 2 * INSET;
     card(x, y, w, 2 * ROW);
     toggleRow(L"Start with Windows", NULL, x, y, w, H_START, panelTest ? pref(L"Start", 1) : startupEnabled(), TRUE);
@@ -630,10 +751,13 @@ static void paintSystem(float x, float y, float w) {
 
     // What Blackout found on this machine: 2 = working, 1 = needs attention, 0 = not set up.
     section(L"STATUS", x, &y, w);
-    card(x, y, w, 7 * 28 + 8);
+    card(x, y, w, 8 * 28 + 8);
     y += 4;
+    // The cause only: the remedy after the colon is on the Fans tab and the Main view, which have the room.
+    lstrcpynW(s, fanWhyText(), 96);
+    if (wcschr(s, L':')) *wcschr(s, L':') = 0;
     if (!fanWhy) wsprintfW(s, L"Active on %d fan%s", outCount, outCount == 1 ? L"" : L"s");
-    statusRow(L"Fan curve", !fanWhy ? s : fanWhy == 1 ? L"Not set up" : fanWhyText(), fanWhy == 0 ? 2 : fanWhy == 1 ? 0 : 1, x, y, w);
+    statusRow(L"Fan curve", fanWhy == 1 ? L"Not set up" : s, fanWhy == 0 ? 2 : fanWhy == 1 ? 0 : 1, x, y, w);
     if (coolant >= 0) wsprintfW(s, L"%d.%d \x00B0" L"C from %s", (int)coolant, (int)(coolant * 10 + 0.5) % 10, srcFrom);
     statusRow(srcDev ? L"Temperature" : L"Water sensor", coolant >= 0 ? s : hasCurve ? L"No reading" : L"Not used", coolant >= 0 ? 2 : hasCurve ? 1 : 0, x, y + 28, w);
     wsprintfW(s, L"Hub connected, %d LEDs", linkLeds);
@@ -644,14 +768,22 @@ static void paintSystem(float x, float y, float w) {
     statusRow(L"Monitor power", ddcIds[0] ? ddcIds : L"Not set up", ddcIds[0] ? 2 : 0, x, y + 140, w);
     BOOL admin = panelTest ? pref(L"Admin", 1) : isElevated();
     statusRow(L"Admin rights", admin ? L"Yes" : L"No, so the fan curve can't run", admin ? 2 : outCount ? 1 : 0, x, y + 168, w);
-    text(L"Blackout " VERSION L"  \x00B7  github.com/Xipzer/blackout-tray", F_TINY, rc(x + 2, SET_H - PAD - 14, w, 14), dim(), 0.8f,
+    int gpu = hasGpu() ? gpuStatus(s, why) : 0;
+    statusRow(L"GPU profile", !hasGpu() ? L"Not set up" : gpu == 1 && why[0] ? why : s, gpu, x, y + 196, w);
+    text(L"Blackout " VERSION L"  \x00B7  github.com/Xipzer/blackout-tray", F_TINY, rc(x + 2, panelH - PAD - 14, w, 14), dim(), 0.8f,
          DWRITE_TEXT_ALIGNMENT_LEADING);
 }
 
-// GPU tab: the selected profile drawn as a picture. Profile pills, its clock curve over the card's own curve, three
-// tiles (power, memory, XBAR) and a status line. Nothing is read from the card while the panel is open (driver reads
-// cost frame time): the curve is the saved one, the status is what the driver answered when it was last sent.
+// GPU tab: one profile drawn as a picture. Profile pills, then a card with the clock curve over the card's own curve,
+// its numbers as chips, and what the driver said last. Nothing is read from the card because the panel is open
+// (driver reads cost frame time): the curve is the saved one, the status is what the driver answered when it was sent.
+// A pill only shows a profile. It is sent when Apply is pressed, so looking is safe and a slip costs nothing.
 static int viewSlot = -1, viewPower, viewMemory, viewCount, viewDelta[NV_SLOTS];
+static int fakePower, fakeMemory = -1, fakeMismatch; // --panel-shot: power= mem= mismatch
+static int gpuShown;   // the profile on show, 0 = the active one
+static BOOL keepArmed; // "Read from card" was pressed on a profile that exists: the next press replaces it
+static BOOL naming;    // the profile's name is being typed (click the name; Enter keeps it, Esc drops it)
+static WCHAR nameBuf[24];
 
 static void gpuView(int slot) {
     if (slot == viewSlot) return;
@@ -660,11 +792,14 @@ static void gpuView(int slot) {
         viewCount = gpuLoad(slot, &viewPower, &viewMemory, viewDelta);
         return;
     }
-    // Preview: a capped curve with a raised top for profile 1, a plain offset for the others.
-    viewPower = slot == 1 ? 121739 : 104000, viewMemory = 3000000, viewCount = gpuPoints;
+    // Preview: profile 1 follows the card's curve 480 MHz up, flattens at 3,090 and has a raised top; profile 2 is
+    // capped at 3,075, below the card's own top end; the others are plain offsets.
+    viewPower = fakePower ? fakePower : slot == 1 ? 121739 : 104000, viewMemory = fakeMemory != -1 ? fakeMemory : slot == 1 ? 3000000 : 2000000;
+    viewCount = gpuPoints - fakeMismatch;
     for (int i = 0; i < gpuPoints; i++) {
-        int want = gpuVolt[i] <= 1100 ? 3090 - (slot - 1) * 15 : gpuVolt[i] >= 1150 ? 3440 : 3090 + (gpuVolt[i] - 1100) * 7;
-        viewDelta[i] = (slot == 1 && gpuBase[i] + 480 > want ? want - gpuBase[i] : slot == 1 ? 480 : 360 - (slot - 2) * 60) * 1000;
+        int top = gpuVolt[i] <= 1100 ? 3090 : gpuVolt[i] >= 1150 ? 3440 : 3090 + (gpuVolt[i] - 1100) * 7;
+        int want = slot == 1 ? top : slot == 2 ? 3075 : 9999, up = slot == 1 ? 480 : slot == 2 ? 400 : 420 - slot * 60;
+        viewDelta[i] = (gpuBase[i] + up > want ? want - gpuBase[i] : up) * 1000;
     }
 }
 
@@ -673,122 +808,193 @@ static void thousands(LPWSTR out, int v) {
     else wsprintfW(out, L"%d", v);
 }
 
-// Small label on top, one big value, the unit under it.
-static void tile(LPCWSTR label, LPCWSTR value, LPCWSTR unit, float x, float y, float w, float h) {
-    card(x, y, w, h);
-    text(label, F_TINY, rc(x + 10, y + 8, w - 20, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    text(value, F_BIG, rc(x, y + 20, w, 40), ink(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
-    text(unit, F_TINY, rc(x, y + h - 22, w, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
-}
-
-static void miniButton(int id, float x, float y, BOOL plus, BOOL can) {
-    D2D1_RECT_F r = rc(x, y, 20, 20);
-    float cx = x + 10, cy = y + 10;
-    if (can) hit[id] = rc(x - 3, y - 3, 26, 26);
-    fillRound(r, 5, tone(), !can ? 0.03f : hover == id ? 0.14f : 0.07f);
-    line(cx - 4, cy, cx + 4, cy, ink(), can ? 1 : 0.3f, 1.5f);
-    if (plus) line(cx, cy - 4, cx, cy + 4, ink(), can ? 1 : 0.3f, 1.5f);
+// The profile on show: the active one until a pill is clicked. One past the last is the empty profile behind "+".
+static int gpuOnShow(void) {
+    int slots = gpuProfiles + (gpuProfiles < 5);
+    return gpuShown >= 1 && gpuShown <= slots ? gpuShown : gpuProfiles ? gpuActive() : 1;
 }
 
 static void paintGpu(float x, float y, float w) {
-    WCHAR s[96];
-    int slot = (int)pref(L"GpuProfile", 1), mhz = (int)pref(L"Xbar", (DWORD)xbarDefault), at = 0, peak = 0;
-    if (slot < 1 || slot > gpuProfiles) slot = 1;
+    WCHAR s[96], title[64], why[64];
+    float ix = x + INSET, iw = w - 2 * INSET, bottom = panelH - PAD;
+    int active = gpuActive(), shown = gpuOnShow(), mhz = (int)pref(L"Xbar", (DWORD)xbarDefault), at = 0;
+    int state = gpuStatus(title, why);
+    BOOL empty = shown > gpuProfiles, live = !empty && shown == active && state == 2 && !gpuWait;
+    BOOL admin = panelTest ? pref(L"Admin", 1) : isElevated(), again = live || (!gpuProfiles && xbarCount && state == 2 && !gpuWait);
     for (int i = 0; i < xbarCount; i++)
         if (xbarSteps[i] == mhz) at = i;
-    if (gpuProfiles) gpuView(slot);
+    if (!empty) gpuView(shown);
 
-    // Profile pills.
-    if (gpuProfiles >= 2) {
-        float pw = (w - 6) / gpuProfiles;
+    // Profiles. Red is the one on the card, the lighter pill is the one on show, "+" is the next empty one.
+    // A profile without a name gets a small pill like "+", so the names get the room.
+    if (gpuProfiles) {
+        int named = 0;
+        for (int i = 1; i <= gpuProfiles; i++) named += gpuNames[i][0] != 0;
+        float plus = gpuProfiles < 5 ? 36 : 0, px = x + 3;
+        float pw = named ? (w - 6 - plus - (gpuProfiles - named) * 36) / named : (w - 6 - plus) / gpuProfiles;
         fillRound(rc(x, y, w, 32), 8, tone(), 0.06f);
-        for (int i = 1; i <= gpuProfiles; i++) {
+        for (int i = 1; i <= gpuProfiles + (plus > 0); i++) {
             int id = H_PROF1 + i - 1;
-            D2D1_RECT_F r = rc(x + 3 + (i - 1) * pw, y + 3, pw, 26);
-            hit[id] = rc(r.left, y, pw, 32);
-            if (i == slot) fillRound(r, 6, ACCENT, 0.9f);
-            else if (hover == id) fillRound(r, 6, tone(), 0.08f);
-            wsprintfW(s, L"%d", i);
-            text(s, F_BOLD, rc(r.left, y + 7, pw, 20), i == slot ? 0xFFFFFF : hover == id ? ink() : dim(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+            D2D1_RECT_F r = rc(px, y + 3, i > gpuProfiles || (named && !gpuNames[i][0]) ? 36 : pw, 26);
+            BOOL on = i == active && state == 2 && !gpuWait;
+            float cx = (r.left + r.right) / 2;
+            px = r.right;
+            hit[id] = rc(r.left, y, r.right - r.left, 32);
+            if (on) fillRound(r, 6, ACCENT, 0.92f);
+            else if (i == shown) fillRound(r, 6, 0xFFFFFF, panelLight ? 0.9f : 0.13f);
+            else if (hover == id) fillRound(r, 6, tone(), 0.06f);
+            if (i == active && !on) strokeRound(rc(r.left + 0.5f, r.top + 0.5f, r.right - r.left - 1, 25), 6, ACCENT, 0.9f, 1);
+            UINT c = on ? 0xFFFFFF : i == shown || hover == id ? ink() : dim();
+            if (i > gpuProfiles) {
+                line(cx - 5, y + 16, cx + 5, y + 16, c, 1, 1.5f);
+                line(cx, y + 11, cx, y + 21, c, 1, 1.5f);
+            } else {
+                wsprintfW(s, L"%d", i);
+                text(gpuNames[i][0] ? gpuNames[i] : s, F_SMALL, rc(r.left + 6, y + 8, r.right - r.left - 12, 18), c, 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+            }
         }
-        y += 32 + 10;
+        y += 32 + GAP;
     }
 
-    // The curve: MHz over volts, this profile in colour over the card's own curve.
-    float ch = gpuProfiles >= 2 ? 170 : 212;
-    card(x, y, w, ch);
-    D2D1_RECT_F g = rc(x + INSET + 30, y + 36, w - 2 * INSET - 30 - 6, ch - 36 - 24);
-    const float v0 = 800, v1 = 1200, f0 = 1000, f1 = 3600;
+    // One card to the bottom of the tab: title, curve, chips, status.
+    card(x, y, w, bottom - y);
+    if (naming) lstrcpyW(s, nameBuf);
+    else if (!empty && gpuNames[shown][0]) lstrcpyW(s, gpuNames[shown]);
+    else wsprintfW(s, L"Profile %d", shown);
+    float nw = measure(s, F_BOLD);
+    if (nw > iw - 140) nw = iw - 140;
+    if (naming) {
+        // The name as a field: what has been typed, and a caret.
+        fillRound(rc(ix - 8, y + 8, iw - 106, 28), 6, tone(), 0.08f);
+        strokeRound(rc(ix - 7.5f, y + 8.5f, iw - 107, 27), 6, ACCENT, 0.9f, 1);
+        line(ix + nw + 1.5f, y + 14, ix + nw + 1.5f, y + 30, ink(), 1, 1);
+    } else if (!empty && !gpuWait) {
+        hit[H_GPU_NAME] = rc(ix - 8, y + 8, nw + 34, 28);
+        if (hover == H_GPU_NAME) fillRound(hit[H_GPU_NAME], 6, tone(), 0.06f);
+        pencil(ix + nw + 13, y + 22, dim(), hover == H_GPU_NAME ? 1 : 0.6f);
+    }
+    text(s, F_BOLD, rc(ix, y + 13, iw - 140, 18), ink(), empty ? 0.7f : 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    // The way in: keep what the card is running now (set by any tuning app) as this profile.
+    if (keepArmed && !empty) button(H_GPU_KEEP, L"Replace it?", x + w - INSET - 106, y + 8, 106, 2, !gpuWait);
+    else button(H_GPU_KEEP, L"Read from card", x + w - INSET - 106, y + 8, 106, empty ? 1 : 3, !gpuWait);
+
+    // The chips under the chart: the profile's power limit and memory offset, and the XBAR stepper.
+    int chips = (empty ? 0 : 2) + (xbarCount > 0);
+    float chipsY = bottom - ROW - INSET - 44, xw = 132, pw3 = xbarCount ? 76 : (iw - 8) / 2, mw = xbarCount ? iw - 16 - xw - pw3 : pw3;
+    D2D1_RECT_F g = rc(ix + 30, y + 46, iw - 30 - 14, (chips ? chipsY - GAP : bottom - ROW - INSET) - 18 - (y + 46));
+
+    // The curve: MHz over volts, this profile over the card's own curve. The scale follows what is drawn.
+    const float v0 = 800, v1 = 1200;
+    BOOL drawn = !empty && gpuPoints && viewCount == gpuPoints;
+    int lo = 1000, hi = 3500, peak = 0, peakAt = -1;
+    if (gpuPoints) lo = 99999, hi = 0;
+    for (int i = 0; i < gpuPoints; i++) {
+        int f = gpuBase[i] + (drawn ? viewDelta[i] / 1000 : 0);
+        if (drawn && f > peak) peak = f, peakAt = i;
+        if (gpuVolt[i] < v0 || gpuVolt[i] > v1) continue;
+        if (gpuBase[i] < lo) lo = gpuBase[i];
+        if ((f > gpuBase[i] ? f : gpuBase[i]) > hi) hi = f > gpuBase[i] ? f : gpuBase[i];
+    }
+    if (lo > hi) lo = 1000, hi = 3500;
+    float f0 = (float)(lo / 500 * 500), f1 = (float)((hi + 499) / 500 * 500);
+    if (f1 - f0 < 1000) f1 = f0 + 1000;
 #define GX(v) (g.left + ((v) - v0) / (v1 - v0) * (g.right - g.left))
 #define GY(f) (g.bottom - ((f) < f0 ? 0 : (f) > f1 ? 1 : ((f) - f0) / (f1 - f0)) * (g.bottom - g.top))
-    for (int f = 2000; f <= 3000; f += 1000) {
+    for (int f = (int)f0; f <= (int)f1; f += 500) {
         line(g.left, GY((float)f), g.right, GY((float)f), tone(), 0.07f, 1);
+        if (f % 1000 || f == (int)f0) continue;
         thousands(s, f);
-        text(s, F_TINY, rc(x + INSET - 4, GY((float)f) - 7, 30, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        text(s, F_TINY, rc(ix - 6, GY((float)f) - 7, 32, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
-    for (int v = 800; v <= 1200; v += 200) {
+    for (int v = 800; v <= 1200; v += 100) {
+        line(GX((float)v), g.top, GX((float)v), g.bottom, tone(), 0.07f, 1);
+        if (v % 200) continue;
         wsprintfW(s, L"%d.%d V", v / 1000, v % 1000 / 100);
-        text(s, F_TINY, rc(v == 800 ? g.left : v == 1200 ? g.right - 48 : GX((float)v) - 24, g.bottom + 5, 48, 14), dim(), 1,
-             v == 800 ? DWRITE_TEXT_ALIGNMENT_LEADING : v == 1200 ? DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_CENTER);
+        text(s, F_TINY, rc(GX((float)v) - 24, g.bottom + 4, 48, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
-    if (gpuPoints && viewCount == gpuPoints) {
+    if (gpuPoints) {
         D2D1_POINT_2F stock[NV_SLOTS], tuned[NV_SLOTS];
         int n = 0;
         for (int i = 0; i < gpuPoints; i++) {
-            int f = gpuBase[i] + viewDelta[i] / 1000;
-            if (f > peak) peak = f;
             if (gpuVolt[i] < v0 || gpuVolt[i] > v1) continue;
             stock[n] = pt(GX((float)gpuVolt[i]), GY((float)gpuBase[i]));
-            tuned[n++] = pt(GX((float)gpuVolt[i]), GY((float)f));
+            tuned[n++] = pt(GX((float)gpuVolt[i]), GY((float)(gpuBase[i] + viewDelta[i] / 1000)));
         }
+        if (drawn) geometry(tuned, n, TRUE, g.bottom, live ? ACCENT : tone(), live ? 0.13f : 0.05f, 0);
         geometry(stock, n, FALSE, 0, tone(), 0.3f, 1.5f);
-        geometry(tuned, n, TRUE, g.bottom, ACCENT, 0.13f, 0);
-        geometry(tuned, n, FALSE, 0, ACCENT, 1, 2.5f);
+        if (drawn) geometry(tuned, n, FALSE, 0, live ? ACCENT : ink(), live ? 1 : 0.8f, 2.5f);
+    }
+    if (drawn && peakAt >= 0) {
+        // The top of the curve and the lowest voltage that reaches it, written beside its marker.
+        WCHAR volt[24];
+        float px = GX((float)gpuVolt[peakAt]), py = GY((float)peak);
+        thousands(s, peak);
+        lstrcatW(s, L" MHz");
+        wsprintfW(volt, L"at %d.%03d V", gpuVolt[peakAt] / 1000, gpuVolt[peakAt] % 1000);
+        float lw = measure(s, F_BOLD), vw = measure(volt, F_SMALL);
+        if (vw > lw) lw = vw;
+        BOOL inPlot = gpuVolt[peakAt] >= v0 && gpuVolt[peakAt] <= v1;
+        if (!inPlot) px = g.right;
+        float lx = px + 8 + lw <= g.right ? px + 8 : px - 8 - lw;
+        if (inPlot) {
+            dashed(px, py, px, g.bottom, tone(), 0.4f);
+            dot(px, py, 3.5f, knob(), 1);
+        }
+        text(s, F_BOLD, rc(lx, g.bottom - 38, lw + 2, 18), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        text(volt, F_SMALL, rc(lx, g.bottom - 21, lw + 2, 16), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     } else {
-        text(!gpuProfiles ? L"No profile saved yet" : gpuPoints ? L"Saved for a different card" : L"The curve shows once the profile has been sent", F_SMALL,
-             rc(g.left, (g.top + g.bottom) / 2 - 9, g.right - g.left, 18), dim(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+        // Under the card's own curve when that is drawn (it rises to the right), in the middle when the plot is bare.
+        D2D1_RECT_F m = rc(g.left, gpuPoints ? g.bottom - 44 : (g.top + g.bottom) / 2 - 18, g.right - g.left - (gpuPoints ? 10 : 0), 18);
+        DWRITE_TEXT_ALIGNMENT side = gpuPoints ? DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_CENTER;
+        text(empty ? L"Nothing saved here yet" : gpuPoints ? L"Saved for a different card" : L"No picture of the curve yet", F_SMALL, m, ink(), 0.7f, side);
+        m.top += 18, m.bottom += 16;
+        text(empty ? L"Tune the card in any app, then read it in" : gpuPoints ? L"Read from card replaces it with this card's" : L"It is drawn once the profile has been sent",
+             F_TINY, m, dim(), 1, side);
     }
 #undef GX
 #undef GY
-    text(gpuProfiles && gpuNames[slot][0] ? gpuNames[slot] : gpuProfiles ? L"Clock curve" : L"GPU", F_BOLD, rc(x + INSET, y + 11, w - 2 * INSET - 110, 18), ink(), 1,
-         DWRITE_TEXT_ALIGNMENT_LEADING);
-    if (peak) {
-        thousands(s, peak);
-        lstrcatW(s, L" MHz");
-        text(s, F_BOLD, rc(x + w - INSET - 110, y + 11, 110, 18), ACCENT, 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    }
-    y += ch + 10;
 
-    // Tiles.
-    float tw = (w - 2 * 8) / 3, th = 84;
-    if (gpuProfiles) wsprintfW(s, L"%d", viewPower / 1000);
-    tile(L"POWER", gpuProfiles ? s : L"-", L"% of stock", x, y, tw, th);
-    if (gpuProfiles) wsprintfW(s, viewMemory > 0 ? L"+%d" : L"%d", viewMemory / 1000);
-    tile(L"MEMORY", gpuProfiles ? s : L"-", L"MHz", x + tw + 8, y, tw, th);
-    if (mhz) wsprintfW(s, L"+%d", mhz);
-    else lstrcpyW(s, L"0");
-    tile(L"XBAR", xbarCount ? s : L"-", L"MHz", x + 2 * (tw + 8), y, tw, th);
+    if (!empty) {
+        if (viewPower) wsprintfW(s, L"%d", viewPower / 1000);
+        else lstrcpyW(s, L"-");
+        chip(s, L"Power %", ix, chipsY, pw3);
+        wsprintfW(s, viewMemory > 0 ? L"+%d" : L"%d", viewMemory / 1000);
+        chip(s, L"Memory MHz", ix + pw3 + 8, chipsY, mw);
+    }
     if (xbarCount) {
-        miniButton(H_XBAR_DN, x + 2 * (tw + 8) + tw - 52, y + 6, FALSE, at > 0);
-        miniButton(H_XBAR_UP, x + 2 * (tw + 8) + tw - 28, y + 6, TRUE, at < xbarCount - 1);
+        // The XBAR stepper as a chip. It belongs to the card, not to a profile, and is sent a moment after the last step.
+        float cx = ix + iw - xw, mid = cx + xw / 2;
+        wsprintfW(s, mhz ? L"+%d" : L"%d", mhz);
+        chip(s, L"XBAR MHz", cx, chipsY, xw);
+        stepButton(H_XBAR_DN, mid - 62, chipsY + 8, FALSE, at > 0 && !gpuWait, 1);
+        stepButton(H_XBAR_UP, mid + 34, chipsY + 8, TRUE, at < xbarCount - 1 && !gpuWait, 1);
     }
-    y += th + 10;
 
-    // What the driver said last time, and a way to send it all again.
-    BOOL admin = panelTest ? pref(L"Admin", 1) : isElevated();
-    int bad = !admin || (gpuProfiles && gpuState != 0 && gpuState != -1) || (xbarCount && xbarState != 0 && xbarState != -1);
-    int idle = gpuProfiles ? gpuState == -1 : xbarState == -1;
-    if (!admin) lstrcpyW(s, L"Needs admin rights");
-    else if (gpuProfiles && gpuState != 0 && gpuState != -1) lstrcpyW(s, gpuNote);
-    else if (xbarCount && xbarState != 0 && xbarState != -1) wsprintfW(s, L"Driver refused XBAR (%d)", xbarState);
-    else if (idle) lstrcpyW(s, L"Not sent yet");
-    else if (gpuProfiles) lstrcpyW(s, gpuNote);
-    else wsprintfW(s, L"Applied at %02d:%02d", xbarSentAt.wHour, xbarSentAt.wMinute);
-    dot(x + 8, y + 16, 3.5f, bad ? warn() : idle ? dim() : GOOD, idle && !bad ? 0.5f : 1);
-    text(s, F_SMALL, rc(x + 20, y + 8, w - 120, 18), bad ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    hit[H_GPU_APPLY] = rc(x + w - 92, y, 92, 32);
-    fillRound(hit[H_GPU_APPLY], 8, tone(), hover == H_GPU_APPLY ? 0.14f : 0.07f);
-    text(L"Re-apply", F_BOLD, rc(x + w - 92, y + 7, 92, 18), ink(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
+    // What the driver said last time, and the button that sends this profile.
+    float ay = bottom - ROW;
+    divider(x, ay, w);
+    BOOL sendable = !empty || (!gpuProfiles && xbarCount);
+    if (gpuWait) {
+        lstrcpyW(title, gpuWait == 2 ? L"Reading the card..." : L"Sending..."), why[0] = 0, state = 0;
+    } else if (naming) {
+        lstrcpyW(title, L"Naming the profile"), lstrcpyW(why, L"Enter keeps the name, Esc drops it"), state = 0;
+    } else if (keepArmed && !empty) {
+        lstrcpyW(title, L"Replace this profile?"), lstrcpyW(why, L"With what the card is running now"), state = 1;
+    } else if (gpuKept == shown && gpuKeptState) {
+        lstrcpyW(title, L"Card not read"), state = 1;
+        if (gpuKeptState == -2) lstrcpyW(why, L"No NVIDIA driver found");
+        else if (gpuKeptState == -1002) lstrcpyW(why, L"blackout.ini could not be written");
+        else if (gpuKeptState == -1000) lstrcpyW(why, L"The card shows no curve points");
+        else wsprintfW(why, L"The driver answered %d", gpuKeptState);
+    } else if (!sendable) {
+        lstrcpyW(title, L"Empty profile"), why[0] = 0, state = 0;
+    } else if (!empty && shown != active && admin) {
+        lstrcpyW(title, L"Not on the card"), why[0] = 0, state = 0;
+    }
+    dot(ix + 4, ay + 22, 3.5f, state == 2 ? GOOD : state == 1 ? warn() : dim(), state ? 1 : 0.5f);
+    text(title, F_ROW, rc(ix + 16, ay + (why[0] ? 6 : 12), iw - 16 - 88, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    if (why[0]) text(why, F_TINY, rc(ix + 16, ay + 26, iw - 16 - 88, 14), state == 1 ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    button(H_GPU_APPLY, again ? L"Re-apply" : L"Apply", x + w - INSET - 80, ay + 8, 80, !again, sendable && admin && !gpuWait);
 }
 
 static void paintPanel(void) {
@@ -895,7 +1101,16 @@ static BOOL panelLoad(void) {
     for (int i = 0; ok && i < F_COUNT; i++) {
         ok = IDWriteFactory_CreateTextFormat(dwf, spec[i].face, NULL, spec[i].weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
                                              spec[i].size, L"en-gb", &fmt[i]) == S_OK;
-        if (ok) IDWriteTextFormat_SetWordWrapping(fmt[i], DWRITE_WORD_WRAPPING_NO_WRAP);
+        if (ok) {
+            // One line, and text that does not fit ends in an ellipsis instead of being cut through a letter.
+            DWRITE_TRIMMING trim = {DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+            IDWriteInlineObject *dots;
+            IDWriteTextFormat_SetWordWrapping(fmt[i], DWRITE_WORD_WRAPPING_NO_WRAP);
+            if (IDWriteFactory_CreateEllipsisTrimmingSign(dwf, fmt[i], &dots) == S_OK) {
+                IDWriteTextFormat_SetTrimming(fmt[i], &trim, dots);
+                IDWriteInlineObject_Release(dots);
+            }
+        }
     }
     if (!ok) panelFree();
     return ok;
@@ -1020,7 +1235,7 @@ static void curveRemove(LPARAM lp) {
 // Switch view. The window only changes size between Main and Settings, and only when their heights differ.
 static void panelGo(int to) {
     RECT r;
-    view = to, hover = H_NONE;
+    view = to, hover = H_NONE, keepArmed = FALSE, naming = FALSE;
     if (to != V_MAIN) settingsTab = to;
     GetWindowRect(panel, &r);
     panelH = viewHeight();
@@ -1028,7 +1243,24 @@ static void panelGo(int to) {
     panelRender(&pos);
 }
 
+// Ends typing a profile's name. keep writes it to [gpu.N] name= in blackout.ini.
+static void nameDone(BOOL keep) {
+    WCHAR sec[16];
+    int slot = gpuOnShow();
+    if (!naming) return;
+    naming = FALSE;
+    if (keep && slot <= gpuProfiles) {
+        lstrcpyW(gpuNames[slot], nameBuf);
+        wsprintfW(sec, L"gpu.%d", slot);
+        if (!panelTest) WritePrivateProfileStringW(sec, L"name", nameBuf, iniPath), tipShown = -2, tipUpdate();
+    }
+    panelDirty();
+}
+
 static void panelClick(int id) {
+    nameDone(TRUE); // a click elsewhere keeps what was typed
+    if (keepArmed && id != H_GPU_KEEP) keepArmed = FALSE, panelDirty(); // any other click takes the question back
+    if (id) gpuKept = 0;
     switch (id) {
     case H_NONE: return;
     case H_SCREENS:
@@ -1041,16 +1273,14 @@ static void panelClick(int id) {
     case H_TAB_FANS:
     case H_TAB_WAKE:
     case H_TAB_SYSTEM: panelGo(V_FANS + id - H_TAB_FANS); return;
-    case H_TAB_GPU: panelGo(V_GPU); return;
+    case H_TAB_GPU:
+    case H_GPU: panelGo(V_GPU); return;
     case H_PROF1:
     case H_PROF2:
     case H_PROF3:
     case H_PROF4:
-    case H_PROF5:
-        // Applied a moment after the last click, so a slip onto the wrong pill can still be corrected.
-        setPref(L"GpuProfile", id - H_PROF1 + 1);
-        if (!panelTest) SetTimer(panelOwner, TIMER_GPU, 700, NULL);
-        break;
+    case H_PROF5: gpuShown = id - H_PROF1 + 1; break; // only shows it: nothing is sent until Apply
+    case H_GPU_NAME: naming = TRUE, lstrcpyW(nameBuf, gpuNames[gpuOnShow()]); break;
     case H_XBAR_DN:
     case H_XBAR_UP: {
         int at = 0, mhz = (int)pref(L"Xbar", (DWORD)xbarDefault);
@@ -1058,11 +1288,27 @@ static void panelClick(int id) {
             if (xbarSteps[i] == mhz) at = i;
         at += id == H_XBAR_UP ? 1 : -1;
         setPref(L"Xbar", xbarSteps[at < 0 ? 0 : at >= xbarCount ? xbarCount - 1 : at]);
-        if (!panelTest) SetTimer(panelOwner, TIMER_XBAR, 700, NULL);
+        // Sent a moment after the last step, so stepping through values does not write each one to the card.
+        if (!panelTest) gpuWait = 1, SetTimer(panelOwner, TIMER_XBAR, 700, NULL);
         break;
     }
     case H_GPU_APPLY:
-        if (!panelTest) SendMessageW(panelOwner, WM_COMMAND, ID_GPU_APPLY, 0);
+        if (gpuOnShow() <= gpuProfiles) setPref(L"GpuProfile", gpuOnShow());
+        if (panelTest) gpuSay(0, L""), xbarState = 0;
+        else gpuWait = 1, SetTimer(panelOwner, TIMER_GPU, 100, NULL);
+        break;
+    case H_GPU_KEEP:
+        // Reads the card once, on the worker thread, and writes the profile to blackout.ini. A profile that exists
+        // is only replaced on a second press.
+        gpuKeepSlot = gpuOnShow();
+        if (gpuKeepSlot <= gpuProfiles && !keepArmed) {
+            keepArmed = TRUE;
+        } else if (panelTest) {
+            if (gpuKeepSlot > gpuProfiles) gpuProfiles = gpuKeepSlot, gpuNames[gpuKeepSlot][0] = 0;
+            keepArmed = FALSE, viewSlot = -1, setPref(L"GpuProfile", gpuKeepSlot), gpuSay(0, L""), xbarState = 0;
+        } else {
+            keepArmed = FALSE, gpuWait = 2, SetTimer(panelOwner, TIMER_KEEP, 50, NULL);
+        }
         break;
     case H_RGB:
         if (panelTest) setPref(L"RgbOn", !pref(L"RgbOn", 1));
@@ -1201,7 +1447,18 @@ static LRESULT CALLBACK panelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         panelDirty();
         return 0;
     case WM_SETCURSOR: return TRUE;
+    case WM_CHAR:
+        if (!naming) return 0;
+        if (wp == L'\r') nameDone(TRUE);
+        else if (wp == L'\b' && nameBuf[0]) nameBuf[lstrlenW(nameBuf) - 1] = 0;
+        else if (wp >= 32 && wp != 127 && lstrlenW(nameBuf) < 23) nameBuf[lstrlenW(nameBuf) + 1] = 0, nameBuf[lstrlenW(nameBuf)] = (WCHAR)wp;
+        panelDirty();
+        return 0;
     case WM_KEYDOWN:
+        if (naming) {
+            if (wp == VK_ESCAPE) nameDone(FALSE);
+            return 0; // the keys belong to the name: no tab switching, and Esc only leaves the field
+        }
         if (wp == VK_ESCAPE) {
             if (view != V_MAIN) panelGo(V_MAIN);
             else DestroyWindow(hwnd);
@@ -1215,7 +1472,7 @@ static LRESULT CALLBACK panelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         panelFree();
         panel = NULL;
-        hover = H_NONE, dragPoint = -1, view = V_MAIN, dirty = FALSE;
+        hover = H_NONE, dragPoint = -1, view = V_MAIN, dirty = FALSE, gpuShown = 0, keepArmed = FALSE, gpuKept = 0, naming = FALSE;
         panelClosedAt = GetTickCount();
         if (panelTest && !panelHidden) PostQuitMessage(0);
         trim();
@@ -1247,6 +1504,7 @@ static BOOL panelShow(HWND owner) {
     }
     panelOwner = owner;
     view = V_MAIN;
+    if (!panelTest) gpuTab = gpuOffered();
     tabsBuild();
     if (!panelTest) panelLight = getDwordAt(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"SystemUsesLightTheme", 0);
     // The monitor that holds the tray icon; dock to its taskbar and right edge.
@@ -1352,8 +1610,11 @@ static BOOL panelShow(HWND owner) {
 //   --panel-test  [flags]              open the panel with preview data; exits on close
 //   --panel-shot  [flags] out=<file>   draw one view off-screen to a .bmp, no window at all (README images, reviews)
 //   --panel-bench                      open and close five times, never shown; log time and memory to %TEMP%
-// Flags: fans wake system | light | x2 | nofans notadmin noread curveoff atcap nohist override ovhot | hotkey wakes edited rgboff
+// Flags: fans wake system gpu | light top | x2 | nofans notadmin noread curveoff atcap nohist override ovhot | hotkey wakes edited rgboff
 //        hover=<id> drag=<point> shade=<percent> grey=<percent>
+// Extremes: temp=<C x10> rpm=<n> max=<percent> names longnames board fanwhy=<2..6> longstatus longwakes
+//           profiles=<0..5> slot=<n> longname power=<percent> mem=<MHz> xbar=<MHz> noxbar unsent nobase mismatch
+//           gpustate=<code> what=<0..2> xbarstate=<code> view=<n> busy reading armed keptfail naming | withgpu scale=<percent>
 
 static BOOL flag(LPCWSTR cmd, LPCWSTR name) {
     WCHAR key[32] = L" ";
@@ -1435,13 +1696,21 @@ static int panelDev(LPWSTR cmd) {
     exeDir(fury, L"furyled.exe");
     hasOpenRgb = openrgb[0] && GetFileAttributesW(openrgb) != INVALID_FILE_ATTRIBUTES;
     hasRam = GetFileAttributesW(fury) != INVALID_FILE_ATTRIBUTES;
-    linkOk = TRUE;
-    hasCurve = outCount && curveN && !flag(cmd, L"nofans") && !flag(cmd, L"notadmin");
-    fanWhy = hasCurve ? 0 : flag(cmd, L"notadmin") ? 2 : 1;
+    linkOk = !flag(cmd, L"longstatus");
+    hasCurve = outCount && curveN && !flag(cmd, L"nofans") && !flag(cmd, L"notadmin") && !wcsstr(cmd, L"fanwhy=");
+    fanWhy = hasCurve ? 0 : flag(cmd, L"notadmin") ? 2 : (at = wcsstr(cmd, L"fanwhy=")) ? _wtoi(at + 7) : 1;
+    if ((at = wcsstr(cmd, L"max="))) fanMax = _wtoi(at + 4);
+    if (flag(cmd, L"names")) lstrcpyW(fanNames, L"Top,Side,Bottom");
+    if (flag(cmd, L"longnames")) lstrcpyW(fanNames, L"Radiator top exhaust,Side intake,Bottom radiator intake");
+    if (flag(cmd, L"board")) srcDev = (Dev *)(INT_PTR)1, lstrcpyW(srcLabel, L"AUXTIN2"), lstrcpyW(srcFrom, L"Nuvoton NCT6796D-R"); // never read
+    if (flag(cmd, L"longstatus")) {
+        lstrcpyW(srcFrom, L"Aquacomputer Farbwerk 360"), lstrcpyW(ddcIds, L"BNQ7F2F,DELA0EC,GSM5B7F,AUS27B1");
+        lstrcpyW(openrgb, L"C:\\missing\\OpenRGB.exe"), linkLeds = 22;
+    }
     // Every switch is faked, so previews and screenshots never depend on (or change) this machine's settings.
     setPref(L"RgbOn", !flag(cmd, L"rgboff")), setPref(L"Sync", 1), setPref(L"Start", 1), setPref(L"Admin", !flag(cmd, L"notadmin"));
     setPref(L"HotkeyMode", flag(cmd, L"hotkey")), setPref(L"WakeClick", 1), setPref(L"WakeEsc", 1), setPref(L"Edited", flag(cmd, L"edited"));
-    coolant = flag(cmd, L"noread") ? -1 : wcsstr(cmd, L"--panel-shot") ? 28.6 : getDword(L"Coolant", 286) / 10.0;
+    coolant = flag(cmd, L"noread") ? -1 : (at = wcsstr(cmd, L"temp=")) ? _wtoi(at + 5) / 10.0 : wcsstr(cmd, L"--panel-shot") ? 28.6 : getDword(L"Coolant", 286) / 10.0;
     curveOn = !flag(cmd, L"curveoff");
     ovOn = flag(cmd, L"override") || flag(cmd, L"ovhot"), ovDuty = 60;
     if (hasCurve && coolant >= 0 && flag(cmd, L"ovhot")) {
@@ -1458,7 +1727,7 @@ static int panelDev(LPWSTR cmd) {
         }
         historyLen = HISTORY, historyPos = 0;
     }
-    for (int i = 0; i < outCount && i < 3; i++) fanRpm[i] = fanDuty < 0 ? 2990 + i * 6 : fanDuty * 34 + i * 17;
+    for (int i = 0; i < outCount && i < 3; i++) fanRpm[i] = (at = wcsstr(cmd, L"rpm=")) ? _wtoi(at + 4) - i * 7 : fanDuty < 0 ? 2990 + i * 6 : fanDuty * 34 + i * 17;
     if (flag(cmd, L"wakes")) {
         static const LPCWSTR why[3] = {L"Left-click (Hotkey mode)", L"Mouse: PRO X SUPERLIGHT 2c", L"No input seen (Windows or an app)"};
         for (wakeCount = 0; wakeCount < 3; wakeCount++) {
@@ -1467,11 +1736,22 @@ static int panelDev(LPWSTR cmd) {
             lstrcpyW(wakes[wakeCount].cause, why[wakeCount]);
         }
     }
+    if (flag(cmd, L"longwakes")) {
+        // The longest causes wakeRecord() can write: a 40 character product name, with and without "(not blocked)".
+        static const LPCWSTR why[MAX_WAKES] = {L"Keyboard: Razer BlackWidow V4 Pro 75% Wireless Ke (not blocked)", L"Mouse: Logitech G502 X PLUS LIGHTSPEED Wireless (not blocked)",
+                                               L"Input device: USB Composite Device Receiver 2.4G", L"Esc (Hotkey mode)", L"No input seen (Windows or an app)"};
+        for (wakeCount = 0; wakeCount < MAX_WAKES; wakeCount++) {
+            GetLocalTime(&wakes[wakeCount].at);
+            wakes[wakeCount].at.wHour = (WORD)(23 - wakeCount * 5), wakes[wakeCount].at.wMinute = (WORD)(48 - wakeCount * 9);
+            lstrcpyW(wakes[wakeCount].cause, why[wakeCount]);
+        }
+    }
+    dockTop = flag(cmd, L"top");
     if ((at = wcsstr(cmd, L"shade="))) shade = _wtoi(at + 6); // try other backgrounds without rebuilding
     if ((at = wcsstr(cmd, L"grey="))) grey = _wtoi(at + 5);
     if ((at = wcsstr(cmd, L"hover="))) hover = _wtoi(at + 6);
     if ((at = wcsstr(cmd, L"drag="))) dragPoint = _wtoi(at + 5);
-    if (flag(cmd, L"gpu")) {
+    if ((gpuTab = flag(cmd, L"gpu") || flag(cmd, L"withgpu"))) {
         // Preview: five profiles on a card shaped like a real one, four XBAR steps, everything sent at 09:15.
         static const int kv[7] = {450, 800, 850, 950, 1000, 1100, 1240}, kf[7] = {180, 700, 1320, 2535, 2715, 2947, 3172};
         for (gpuPoints = 0; gpuPoints < 127; gpuPoints++) {
@@ -1480,9 +1760,32 @@ static int panelDev(LPWSTR cmd) {
             gpuVolt[gpuPoints] = v, gpuBase[gpuPoints] = kf[k] + (kf[k + 1] - kf[k]) * (v - kv[k]) / (kv[k + 1] - kv[k]);
         }
         xbarCount = 4, xbarSteps[0] = 0, xbarSteps[1] = 300, xbarSteps[2] = 400, xbarSteps[3] = 500, xbarDefault = 400, gpuProfiles = 5;
+        for (int i = 1; i <= 5; i++) gpuNames[i][0] = 0;
         lstrcpyW(gpuNames[1], L"Maximum"), lstrcpyW(gpuNames[2], L"Reliable");
-        setPref(L"Xbar", 400), setPref(L"GpuProfile", 1);
+        if (flag(cmd, L"fivenames"))
+            lstrcpyW(gpuNames[1], L"Maximum"), lstrcpyW(gpuNames[2], L"Reliable"), lstrcpyW(gpuNames[3], L"Fallback"), lstrcpyW(gpuNames[4], L"Compute"), lstrcpyW(gpuNames[5], L"Stock");
+        if (flag(cmd, L"longname")) lstrcpyW(gpuNames[1], L"Maximum, top 3,440 MHz"), lstrcpyW(gpuNames[2], L"Reliable, cap 3,075 MHz"), lstrcpyW(gpuNames[3], L"Quiet, cap 2,900 MHz");
+        if ((at = wcsstr(cmd, L"profiles="))) gpuProfiles = _wtoi(at + 9);
+        if (flag(cmd, L"noxbar")) xbarCount = 0;
+        if ((at = wcsstr(cmd, L"power="))) fakePower = _wtoi(at + 6) * 1000 + 739;
+        if ((at = wcsstr(cmd, L"mem="))) fakeMemory = _wtoi(at + 4) * 1000;
+        fakeMismatch = flag(cmd, L"mismatch");
+        if (flag(cmd, L"nobase")) gpuPoints = 0;
+        setPref(L"Xbar", (at = wcsstr(cmd, L" xbar=")) ? _wtoi(at + 6) : 400), setPref(L"GpuProfile", (at = wcsstr(cmd, L"slot=")) ? _wtoi(at + 5) : 1);
         gpuState = xbarState = 0, xbarSent = 400, xbarSentAt.wHour = 9, xbarSentAt.wMinute = 15, lstrcpyW(gpuNote, L"Applied at 09:15");
+        // Every answer gpuSay() and gpuThread() can leave behind.
+        if ((at = wcsstr(cmd, L"gpustate="))) {
+            static const LPCWSTR what[3] = {L"Power limit", L"Memory offset", L"Curve"};
+            LPCWSTR w = wcsstr(cmd, L"what=");
+            gpuSay(_wtoi(at + 9), what[w ? _wtoi(w + 5) % 3 : 0]);
+            if (gpuState == -2) lstrcpyW(gpuNote, L"No NVIDIA driver found");
+        }
+        if ((at = wcsstr(cmd, L"xbarstate="))) xbarState = _wtoi(at + 10);
+        if (flag(cmd, L"unsent")) gpuState = xbarState = -1;
+        if ((at = wcsstr(cmd, L"view="))) gpuShown = _wtoi(at + 5);
+        gpuWait = flag(cmd, L"busy") ? 1 : flag(cmd, L"reading") ? 2 : 0, keepArmed = flag(cmd, L"armed");
+        if (flag(cmd, L"keptfail")) gpuKept = gpuOnShow(), gpuKeptState = -1002;
+        if (flag(cmd, L"naming")) naming = TRUE, lstrcpyW(nameBuf, L"Quiet, cap 2,9");
     } else {
         gpuProfiles = xbarCount = 0; // screenshots of the other tabs don't depend on this machine's blackout.ini
     }
@@ -1493,12 +1796,15 @@ static int panelDev(LPWSTR cmd) {
         return 0;
     }
     if (wcsstr(cmd, L"--panel-shot")) {
-        panelScale = flag(cmd, L"x2") ? 2 : 1;
+        panelScale = flag(cmd, L"x2") ? 2 : (at = wcsstr(cmd, L"scale=")) ? _wtoi(at + 6) / 100.0f : 1;
         view = to;
         return out && panelShot(out + 4) ? 0 : 1;
     }
     if (!panelShow(NULL)) return 1;
     if (to != V_MAIN) panelGo(to);
-    while (GetMessageW(&m, NULL, 0, 0) > 0) DispatchMessageW(&m);
+    while (GetMessageW(&m, NULL, 0, 0) > 0) {
+        if (naming) TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
     return 0;
 }
