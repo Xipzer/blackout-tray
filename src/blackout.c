@@ -1208,7 +1208,7 @@ static void showMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING, ID_SCREENS, L"Screens off");
     if (hasRgb) {
         AppendMenuW(menu, MF_STRING, ID_RGB, rgbShown() ? L"RGB off" : L"RGB on");
-        AppendMenuW(menu, MF_STRING | (getDword(L"Sync", 1) ? MF_CHECKED : 0), ID_SYNC, L"RGB turns off with screens");
+        AppendMenuW(menu, MF_STRING | (getDword(L"Sync", 1) ? MF_CHECKED : 0), ID_SYNC, L"RGB off with the screens");
     }
     if (hasFans) {
         HMENU fans = CreatePopupMenu(), awake = CreatePopupMenu(), slept = CreatePopupMenu();
@@ -1274,7 +1274,7 @@ static void wakeRecord(void) {
     WCHAR cause[96] = L"", path[256], name[48] = L"";
     UINT n = 256;
     if (hotkeyCause) {
-        lstrcpyW(cause, hotkeyCause == 1 ? L"Left-click (Hotkey mode)" : L"Esc (Hotkey mode)");
+        lstrcpyW(cause, hotkeyCause == 1 ? L"Left-click" : L"Esc");
     } else if (rawTick && GetTickCount() - rawTick < 5000) {
         if (rawDevice && GetRawInputDeviceInfoW(rawDevice, RIDI_DEVICENAME, path, &n) != (UINT)-1) {
             HANDLE h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
@@ -1288,7 +1288,7 @@ static void wakeRecord(void) {
         wsprintfW(cause, L"%s%s%s%s", rawType == RIM_TYPEMOUSE ? L"Mouse" : rawType == RIM_TYPEKEYBOARD ? L"Keyboard" : L"Input device",
                   name[0] ? L": " : L"", name, hookThread ? L" (not blocked)" : L"");
     } else {
-        lstrcpyW(cause, L"No input seen (Windows or an app)");
+        lstrcpyW(cause, L"No input: Windows or an app");
     }
     for (int i = MAX_WAKES - 1; i > 0; i--) wakes[i] = wakes[i - 1];
     GetLocalTime(&wakes[0].at);
