@@ -17,6 +17,7 @@
 #define ID_STARTUP   4
 #define ID_EXIT      5
 #define ID_SYNC      6
+#define ID_HOTKEY    7
 #define TIMER_OFF    1
 #define TIMER_BUSY   2
 #define TIMER_LINK   3
@@ -48,11 +49,15 @@ static DWORD idleRestore = (DWORD)-1;
 static HPOWERNOTIFY displayNotify;
 static HWND panel;
 static void panelUpdate(void);
-// Cached switches, so the 4 s tick never reads the registry. Written through to HKCU when changed.
-static BOOL litOn = TRUE, litWant = TRUE, linkOk;
-// What woke the screens (panel > Settings > Wake). Kept in memory only, newest first.
+// The switches, read from HKCU\Software\Blackout once at startup and written through when changed, so neither the
+// 4 s tick nor a display event nor the panel reads the registry. litWant is what the user wants while the screens are
+// on (the RGB switch), litOn the lighting right now, which also goes off with the screens when syncOn is set.
+static BOOL litOn = TRUE, litWant = TRUE, syncOn = TRUE, hotkeyOn, wakeClick = TRUE, wakeEsc = TRUE;
+static BOOL linkOk; // the iCUE LINK hub took the last frame
+// What woke the screens. Kept in memory only, newest first. icon: 'M' mouse, 'K' keyboard, 0 neither. slip: the input
+// got past the wake rules.
 #define MAX_WAKES 5
-static struct { SYSTEMTIME at; WCHAR cause[96]; } wakes[MAX_WAKES];
+static struct { SYSTEMTIME at; WCHAR icon, name[64]; BOOL slip; } wakes[MAX_WAKES];
 static int wakeCount;
 static HANDLE rawDevice, hookThread;
 static DWORD rawType, rawTick, hotkeyCause, hookThreadId;
@@ -62,11 +67,6 @@ static void ddcPower(BOOL on);
 static DWORD getDword(LPCWSTR name, DWORD fallback) {
     DWORD v, n = sizeof(v);
     return RegGetValueW(HKEY_CURRENT_USER, APP_KEY, name, RRF_RT_REG_DWORD, NULL, &v, &n) == ERROR_SUCCESS ? v : fallback;
-}
-
-static DWORD getDwordAt(HKEY root, LPCWSTR key, LPCWSTR name, DWORD fallback) {
-    DWORD v, n = sizeof(v);
-    return RegGetValueW(root, key, name, RRF_RT_REG_DWORD, NULL, &v, &n) == ERROR_SUCCESS ? v : fallback;
 }
 
 static void setDword(LPCWSTR name, DWORD v) {
@@ -79,7 +79,7 @@ static BOOL startupEnabled(void) {
 }
 
 static void toggleStartup(void) {
-    WCHAR path[MAX_PATH + 2] = L"\"";
+    WCHAR path[MAX_PATH + 3] = L"\"";
     if (startupEnabled()) {
         RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, APP_NAME);
         return;
@@ -262,10 +262,13 @@ static void restoreWindows(void) {
 // Screens off the same way Windows' own idle timeout does it: drop the display timeout to 1 s, then put it back once
 // the displays report off. The legacy SC_MONITORPOWER message leaves some outputs (e.g. the Intel iGPU's DisplayPort)
 // half-alive, which makes the monitor on it keep flashing "No Signal". SC_MONITORPOWER stays as a fallback.
+// A PC has two display timeouts, plugged in and on battery: the one in use when the click came is the one changed.
+static BOOL idleOnBattery;
+
 static void setIdleTimeout(DWORD seconds) {
     GUID *scheme;
     if (PowerGetActiveScheme(NULL, &scheme) != ERROR_SUCCESS) return;
-    PowerWriteACValueIndex(NULL, scheme, &GUID_VIDEO_SUBGROUP, &GUID_VIDEO_POWERDOWN_TIMEOUT, seconds);
+    (idleOnBattery ? PowerWriteDCValueIndex : PowerWriteACValueIndex)(NULL, scheme, &GUID_VIDEO_SUBGROUP, &GUID_VIDEO_POWERDOWN_TIMEOUT, seconds);
     PowerSetActiveScheme(NULL, scheme);
     LocalFree(scheme);
 }
@@ -273,10 +276,12 @@ static void setIdleTimeout(DWORD seconds) {
 static void screensOff(HWND hwnd) {
     GUID *scheme;
     DWORD current;
+    SYSTEM_POWER_STATUS power;
     // DDC monitors go to standby first, while their link is still up; once the GPU output sleeps, DDC can't reach them.
     ddcPower(FALSE);
     if (idleRestore == (DWORD)-1 && PowerGetActiveScheme(NULL, &scheme) == ERROR_SUCCESS) {
-        if (PowerReadACValueIndex(NULL, scheme, &GUID_VIDEO_SUBGROUP, &GUID_VIDEO_POWERDOWN_TIMEOUT, &current) == ERROR_SUCCESS) {
+        idleOnBattery = GetSystemPowerStatus(&power) && power.ACLineStatus == 0;
+        if ((idleOnBattery ? PowerReadDCValueIndex : PowerReadACValueIndex)(NULL, scheme, &GUID_VIDEO_SUBGROUP, &GUID_VIDEO_POWERDOWN_TIMEOUT, &current) == ERROR_SUCCESS) {
             idleRestore = current;
             setIdleTimeout(1);
         }
@@ -335,10 +340,6 @@ static void trim(void) {
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
 }
 
-// The RGB switch shows what the user wants while the screens are on (HKCU RgbWant). RgbOn is the state right now,
-// which also goes off with the screens when that option is ticked.
-static BOOL rgbShown(void) { return litWant; }
-
 static void setRgb(HWND hwnd, BOOL on);
 static void rgbToggle(HWND hwnd) {
     litWant = !litWant;
@@ -365,9 +366,11 @@ static void showMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_SCREENS, L"Screens off");
     if (hasRgb) {
-        AppendMenuW(menu, MF_STRING, ID_RGB, rgbShown() ? L"RGB off" : L"RGB on");
-        AppendMenuW(menu, MF_STRING | (getDword(L"Sync", 1) ? MF_CHECKED : 0), ID_SYNC, L"RGB off with the screens");
+        AppendMenuW(menu, MF_STRING, ID_RGB, litWant ? L"RGB off" : L"RGB on");
+        AppendMenuW(menu, MF_STRING | (syncOn ? MF_CHECKED : 0), ID_SYNC, L"RGB off with the screens");
     }
+    AppendMenuW(menu, MF_STRING | (hotkeyOn ? MF_CHECKED : 0), ID_HOTKEY,
+                wakeClick && wakeEsc ? L"Wake the screens only with a left-click or Esc" : wakeClick ? L"Wake the screens only with a left-click" : L"Wake the screens only with Esc");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING | (startupEnabled() ? MF_CHECKED : 0), ID_STARTUP, L"Start with Windows");
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
@@ -388,10 +391,11 @@ static void wakeWatch(HWND hwnd, BOOL on) {
 }
 
 static void wakeRecord(void) {
-    WCHAR cause[96] = L"", path[256], name[48] = L"";
+    WCHAR path[256], name[48] = L"", icon = 0, *kind = L"No input: Windows or an app";
     UINT n = 256;
+    BOOL slip = FALSE;
     if (hotkeyCause) {
-        lstrcpyW(cause, hotkeyCause == 1 ? L"Left-click" : L"Esc");
+        icon = hotkeyCause == 1 ? L'M' : L'K', kind = hotkeyCause == 1 ? L"Left-click" : L"Esc";
     } else if (rawTick && GetTickCount() - rawTick < 5000) {
         if (rawDevice && GetRawInputDeviceInfoW(rawDevice, RIDI_DEVICENAME, path, &n) != (UINT)-1) {
             HANDLE h = CreateFileW(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
@@ -401,24 +405,27 @@ static void wakeRecord(void) {
             }
         }
         name[40] = 0;
-        // With Hotkey mode armed, input should not have been able to wake the screens; say so if it did.
-        wsprintfW(cause, L"%s%s%s%s", rawType == RIM_TYPEMOUSE ? L"Mouse" : rawType == RIM_TYPEKEYBOARD ? L"Keyboard" : L"Input device",
-                  name[0] ? L": " : L"", name, hookThread ? L" (not blocked)" : L"");
-    } else {
-        lstrcpyW(cause, L"No input: Windows or an app");
+        icon = rawType == RIM_TYPEMOUSE ? L'M' : rawType == RIM_TYPEKEYBOARD ? L'K' : 0;
+        kind = icon == L'M' ? L"Mouse" : icon ? L"Keyboard" : L"Input device";
+        // With the wake rules armed, input should not have been able to wake the screens; say so if it did.
+        slip = hookThread != NULL;
     }
     for (int i = MAX_WAKES - 1; i > 0; i--) wakes[i] = wakes[i - 1];
     GetLocalTime(&wakes[0].at);
-    lstrcpyW(wakes[0].cause, cause);
+    wakes[0].icon = icon, wakes[0].slip = slip;
+    // The icon says mouse or keyboard, so a named device is listed by its name alone.
+    if (name[0] && icon) lstrcpyW(wakes[0].name, name);
+    else wsprintfW(wakes[0].name, name[0] ? L"%s: %s" : L"%s", kind, name);
     if (wakeCount < MAX_WAKES) wakeCount++;
 }
 
-// Hotkey mode: while the screens are off, low-level hooks swallow all keyboard and mouse input except the chosen
-// wake inputs (left-click and/or Esc), so a bumped mouse or desk vibration can't wake the screens. The hooks live on
-// a short-lived thread that exists only while the screens are off. Ctrl+Alt+Del always gets through (Windows).
+// Wake rules ("Wake the screens only with", HKCU HotkeyMode): while the screens are off, low-level hooks swallow all
+// keyboard and mouse input except the chosen wake inputs (left-click and/or Esc), so a bumped mouse or desk vibration
+// can't wake the screens. The hooks live on a short-lived thread that exists only while the screens are off.
+// Ctrl+Alt+Del always gets through (Windows). Windows does not show a normal program the input that goes to a
+// program running as admin, so with such a window in front the rules are not in force (README, Limits).
 #define WM_WAKE (WM_APP + 2)
 static HWND mainWnd;
-static BOOL wakeClick, wakeEsc;
 
 static LRESULT CALLBACK hookKeys(int code, WPARAM wp, LPARAM lp) {
     if (code != HC_ACTION || (((KBDLLHOOKSTRUCT *)lp)->flags & LLKHF_INJECTED)) return CallNextHookEx(NULL, code, wp, lp);
@@ -443,9 +450,7 @@ static DWORD WINAPI hookMain(LPVOID unused) {
 }
 
 static void hotkeyArm(void) {
-    if (hookThread || !getDword(L"HotkeyMode", 0)) return;
-    wakeClick = getDword(L"WakeClick", 1), wakeEsc = getDword(L"WakeEsc", 1);
-    if (!wakeClick && !wakeEsc) return; // nothing could wake the screens; stay safe
+    if (hookThread || !hotkeyOn || (!wakeClick && !wakeEsc)) return; // with neither input nothing could wake the screens
     hookThread = CreateThread(NULL, 0, hookMain, NULL, 0, &hookThreadId);
 }
 
@@ -519,7 +524,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case ID_SCREENS: SetTimer(hwnd, TIMER_OFF, 400, NULL); return 0;
         case ID_RGB: rgbToggle(hwnd); return 0;
-        case ID_SYNC: setDword(L"Sync", !getDword(L"Sync", 1)); return 0;
+        case ID_SYNC: setDword(L"Sync", syncOn = !syncOn); return 0;
+        case ID_HOTKEY: setDword(L"HotkeyMode", hotkeyOn = !hotkeyOn); return 0;
         case ID_STARTUP: toggleStartup(); return 0;
         case ID_EXIT: DestroyWindow(hwnd); return 0;
         }
@@ -549,7 +555,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     screensOn = state == 1;
                     if (screensOn) hotkeyDisarm();
                     else hotkeyArm();
-                    if (hasRgb && getDword(L"Sync", 1)) setRgb(hwnd, screensOn && litWant);
+                    if (hasRgb && syncOn) setRgb(hwnd, screensOn && litWant);
+                    panelUpdate();
                 }
             }
         }
@@ -626,8 +633,10 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     exeDir(fury, L"furyled.exe");
     hasOpenRgb = openrgb[0] && GetFileAttributesW(openrgb) != INVALID_FILE_ATTRIBUTES;
     hasRam = GetFileAttributesW(fury) != INVALID_FILE_ATTRIBUTES;
-    litOn = getDword(L"RgbOn", 1), litWant = getDword(L"RgbWant", 1);
-    // An elevated window drops messages from normal processes unless allowed (tray clicks and remote "screens off").
+    litOn = getDword(L"RgbOn", 1), litWant = getDword(L"RgbWant", 1), syncOn = getDword(L"Sync", 1);
+    hotkeyOn = getDword(L"HotkeyMode", 0), wakeClick = getDword(L"WakeClick", 1), wakeEsc = getDword(L"WakeEsc", 1);
+    // Blackout needs no admin rights, but may be started with them. An elevated window drops messages from normal
+    // processes unless allowed (tray clicks and remote "screens off").
     ChangeWindowMessageFilterEx(hwnd, WM_COMMAND, MSGFLT_ALLOW, NULL);
     ChangeWindowMessageFilterEx(hwnd, WM_TRAY, MSGFLT_ALLOW, NULL);
     ChangeWindowMessageFilterEx(hwnd, taskbarCreated, MSGFLT_ALLOW, NULL);

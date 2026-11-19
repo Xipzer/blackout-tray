@@ -3,18 +3,18 @@
 //
 // Cost model: the panel exists only while it is open. d2d1.dll and dwrite.dll are loaded on open and freed on close.
 // Drawing is done on the CPU (software DC render target) into a 32-bit bitmap that is handed to a layered window.
-// For a 372 px panel that opens in about 15 ms and needs about 15 MB while open, where a GPU target took 90 to 400 ms
-// and 60 to 70 MB because it loads the graphics driver into the process. Measured with --panel-bench.
+// A GPU target took 90 to 400 ms and 60 to 70 MB because it loads the graphics driver into the process. Measured
+// with --panel-bench.
 //
 // Look: docked flush to the taskbar and the screen edge, square on those sides, one rounded corner facing the desktop,
 // and filled with the taskbar's own colour (sampled when it opens) so it reads as part of the same surface.
 //
-// Views: Main (screens off, lighting, live cooling, the GPU profile) and Settings with tabs Fans, Wake, GPU, System.
+// One view, no pages and no tabs. From the top: Screens off, the lighting card (only when lighting is set up), the
+// wake rules with the log of what woke the screens (only once something has), Start with Windows, and at the foot
+// the parts Blackout drives on this PC (only those that are set up), the version and Exit. A PC with nothing set up
+// gets the button, the wake rules and Start with Windows, and no row that says what is missing.
 //
-// Type: the big numerals (F_BIG) are for live readings only. Settings are drawn as charts and chips. Red (ACCENT) means
-// "on": a switch that is on, the profile that is on the card, the one main action of a view.
-// Words: a row has one line, and its title says what the control does without help. No hint lines, no labels over
-// cards that explain themselves. Secondary text only for state that changes or for what nothing else can say.
+// Red (ACCENT) means "on". A row has one line, and its title says what the control does without help. No hint lines.
 #define COBJMACROS
 #include <d2d1.h>
 #include <dwrite.h>
@@ -23,25 +23,23 @@
 #include <psapi.h>
 
 #define PANEL_CLASS L"BlackoutPanel"
-#define VERSION     L"1.1.0"
-#define PANEL_W     372.0f
-#define SET_H       476.0f // every Settings tab has this height, so the tabs never move under the cursor
+#define VERSION     L"2.0.0"
+#define PANEL_W     352.0f
 #define PAD         16.0f
 #define INSET       14.0f
 #define GAP         12.0f
 #define ROW         40.0f // one line of text and one control
-#define NOTICE      44.0f // the one row with two lines: something is wrong, and why
-#define SECT        18.0f
-#define LABEL       22.0f
+#define LABEL       24.0f // the heading of the wake log
+#define LOG         24.0f // one wake in the log
+#define LINE        22.0f // one line of parts
 #define RADIUS      8
 #define ACCENT      0xE5484D
 #define WARN        0xF0A35B
 #define GOOD        0x3FB950
 #define WM_RENDER   (WM_APP + 3)
 
-enum { H_NONE, H_SCREENS, H_GEAR, H_BACK, H_TAB_WAKE, H_TAB_SYSTEM, H_RGB, H_SYNC, H_START, H_EXIT, H_HOTKEY, H_WAKE_CLICK, H_WAKE_ESC, H_COUNT };
-enum { F_BRAND, F_ROW, F_SMALL, F_BIG, F_UNIT, F_BOLD, F_TINY, F_COUNT };
-enum { V_MAIN, V_WAKE, V_SYSTEM };
+enum { H_NONE, H_SCREENS, H_RGB, H_SYNC, H_HOTKEY, H_WAKE_CLICK, H_WAKE_ESC, H_START, H_EXIT, H_COUNT };
+enum { F_BRAND, F_ROW, F_SMALL, F_BOLD, F_TINY, F_COUNT };
 
 static const GUID IID_D2DFactory = {0x06152247, 0x6f50, 0x465a, {0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07}};
 static const GUID IID_DWFactory = {0xb859ee5a, 0xd838, 0x4b5b, {0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48}};
@@ -63,30 +61,11 @@ static IDWriteTextFormat *fmt[F_COUNT];
 static HWND panelOwner;
 static float panelScale = 1, panelH;
 static D2D1_RECT_F hit[H_COUNT];
-static int hover, view = V_MAIN, settingsTab = V_WAKE;
-static BOOL dockTop, panelLight, panelTest, panelHidden, dirty;
+static int hover;
+// startOn is read once when the panel opens. panelTest: a developer mode, where no switch reaches the PC.
+static BOOL dockTop, panelLight, panelTest, panelHidden, dirty, startOn;
 static DWORD panelClosedAt;
-// Preview values for --panel-test / --panel-shot, so screenshots don't depend on the machine's settings.
-static struct { LPCWSTR name; DWORD value; } fake[16];
-static int fakeCount;
-
-static DWORD pref(LPCWSTR name, DWORD fallback) {
-    for (int i = 0; i < fakeCount; i++)
-        if (!lstrcmpW(fake[i].name, name)) return fake[i].value;
-    return getDword(name, fallback);
-}
-static void setPref(LPCWSTR name, DWORD v) {
-    if (!panelTest) {
-        setDword(name, v);
-        return;
-    }
-    for (int i = 0; i < fakeCount; i++)
-        if (!lstrcmpW(fake[i].name, name)) {
-            fake[i].value = v;
-            return;
-        }
-    if (fakeCount < 16) fake[fakeCount].name = name, fake[fakeCount++].value = v;
-}
+static UINT panelTint; // 0xRRGGBB taken from the taskbar, 0 = none
 
 // ---- Drawing primitives ----
 
@@ -98,8 +77,7 @@ static UINT ink(void) { return panelLight ? 0x1B1B1F : 0xF3F3F3; }
 static UINT dim(void) { return panelLight ? 0x5F5F66 : 0xA8A8AD; }
 static UINT tone(void) { return panelLight ? 0x000000 : 0xFFFFFF; }
 static UINT warn(void) { return panelLight ? 0xB45309 : WARN; }
-static UINT panelTint; // 0xRRGGBB taken from the taskbar, 0 = none
-static int shade = 100, grey; // percent of the taskbar's brightness, and percent of its colour removed
+static UINT good(void) { return panelLight ? 0x1A7F37 : GOOD; }
 static UINT baseColor(void) { return panelTint ? panelTint : panelLight ? 0xEDEDED : 0x1C1E20; }
 
 static void paint(UINT rgb, float a) {
@@ -139,6 +117,7 @@ static void line(float x0, float y0, float x1, float y1, UINT rgb, float a, floa
     paint(rgb, a);
     ID2D1RenderTarget_DrawLine(rt, pt(x0, y0), pt(x1, y1), (ID2D1Brush *)brush, w, NULL);
 }
+// Every format is one line and ends in an ellipsis when the text does not fit its rectangle (panelLoad).
 static void text(LPCWSTR s, int f, D2D1_RECT_F r, UINT rgb, float a, DWRITE_TEXT_ALIGNMENT align) {
     IDWriteTextFormat_SetTextAlignment(fmt[f], align);
     paint(rgb, a);
@@ -153,27 +132,10 @@ static float measure(LPCWSTR s, int f) {
     IDWriteTextLayout_Release(l);
     return m.widthIncludingTrailingWhitespace;
 }
-// Open arc, clockwise from (x0, y0) to (x1, y1), taking the long way round when large is set.
-static void arc(float x0, float y0, float x1, float y1, float r, BOOL large, UINT rgb, float w) {
-    ID2D1PathGeometry *g;
-    ID2D1GeometrySink *sink;
-    if (ID2D1Factory_CreatePathGeometry(d2f, &g) != S_OK) return;
-    if (ID2D1PathGeometry_Open(g, &sink) == S_OK) {
-        D2D1_ARC_SEGMENT seg = {{x1, y1}, {r, r}, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, large ? D2D1_ARC_SIZE_LARGE : D2D1_ARC_SIZE_SMALL};
-        ID2D1GeometrySink_BeginFigure(sink, pt(x0, y0), D2D1_FIGURE_BEGIN_HOLLOW);
-        ID2D1GeometrySink_AddArc(sink, &seg);
-        ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
-        ID2D1GeometrySink_Close(sink);
-        ID2D1GeometrySink_Release(sink);
-        paint(rgb, 1);
-        ID2D1RenderTarget_DrawGeometry(rt, (ID2D1Geometry *)g, (ID2D1Brush *)brush, w, NULL);
-    }
-    ID2D1PathGeometry_Release(g);
-}
 
 // ---- Icons ----
 
-// Crescent as a real shape (disc minus disc), so it sits cleanly on the translucent background.
+// Crescent as a real shape (disc minus disc), so it sits cleanly on the background.
 static void moon(float x, float y, float r) {
     D2D1_ELLIPSE outer = {{x, y}, r, r}, cut = {{x + r * 0.55f, y - r * 0.1f}, r * 0.8f, r * 0.8f};
     ID2D1EllipseGeometry *a, *b;
@@ -195,22 +157,23 @@ static void moon(float x, float y, float r) {
     }
     ID2D1EllipseGeometry_Release(a);
 }
+// The power symbol: an open ring, clockwise the long way round from one side of the gap to the other, and a stroke.
 static void powerIcon(float cx, float cy, UINT rgb) {
-    arc(cx + 3.3f, cy - 4.4f, cx - 3.3f, cy - 4.4f, 5.5f, TRUE, rgb, 2);
-    line(cx, cy - 7.5f, cx, cy - 1, rgb, 1, 2);
-}
-static void gear(float cx, float cy, UINT rgb) {
-    static const float c8[8] = {1, 0.7071f, 0, -0.7071f, -1, -0.7071f, 0, 0.7071f};
-    for (int i = 0; i < 8; i++) {
-        float c = c8[i], s = c8[(i + 6) % 8];
-        line(cx + c * 5.5f, cy + s * 5.5f, cx + c * 8.5f, cy + s * 8.5f, rgb, 1, 2.6f);
+    ID2D1PathGeometry *g;
+    ID2D1GeometrySink *sink;
+    if (ID2D1Factory_CreatePathGeometry(d2f, &g) != S_OK) return;
+    if (ID2D1PathGeometry_Open(g, &sink) == S_OK) {
+        D2D1_ARC_SEGMENT seg = {{cx - 3.3f, cy - 4.4f}, {5.5f, 5.5f}, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_LARGE};
+        ID2D1GeometrySink_BeginFigure(sink, pt(cx + 3.3f, cy - 4.4f), D2D1_FIGURE_BEGIN_HOLLOW);
+        ID2D1GeometrySink_AddArc(sink, &seg);
+        ID2D1GeometrySink_EndFigure(sink, D2D1_FIGURE_END_OPEN);
+        ID2D1GeometrySink_Close(sink);
+        ID2D1GeometrySink_Release(sink);
+        paint(rgb, 1);
+        ID2D1RenderTarget_DrawGeometry(rt, (ID2D1Geometry *)g, (ID2D1Brush *)brush, 2, NULL);
     }
-    ring(cx, cy, 5.5f, rgb, 1, 2);
-    dot(cx, cy, 2, rgb, 1);
-}
-static void chevronLeft(float cx, float cy, UINT rgb) {
-    line(cx + 3, cy - 6, cx - 3, cy, rgb, 1, 2);
-    line(cx - 3, cy, cx + 3, cy + 6, rgb, 1, 2);
+    ID2D1PathGeometry_Release(g);
+    line(cx, cy - 7.5f, cx, cy - 1, rgb, 1, 2);
 }
 static void mouseIcon(float cx, float cy, UINT rgb, float a) {
     strokeRound(rc(cx - 4.5f, cy - 7, 9, 14), 4.5f, rgb, a, 1.3f);
@@ -224,181 +187,103 @@ static void keyboardIcon(float cx, float cy, UINT rgb, float a) {
 
 // ---- Controls ----
 
-static void toggle(float x, float y, BOOL on, BOOL hot, BOOL enabled) {
-    D2D1_RECT_F r = rc(x, y, 40, 20);
-    if (!enabled) {
-        strokeRound(r, 10, dim(), 0.35f, 1);
-        dot(x + (on ? 30 : 10), y + 10, 5, dim(), 0.35f);
-    } else if (on) {
-        fillRound(r, 10, ACCENT, hot ? 0.85f : 1);
-        dot(x + 30, y + 10, 6, 0xFFFFFF, 1);
-    } else {
-        fillRound(r, 10, tone(), hot ? 0.10f : 0.04f);
-        strokeRound(r, 10, dim(), 0.9f, 1);
-        dot(x + 10, y + 10, 5, dim(), 1);
-    }
-}
 static void card(float x, float y, float w, float h) {
     fillRound(rc(x, y, w, h), 8, tone(), 0.045f);
     strokeRound(rc(x, y, w, h), 8, tone(), 0.07f, 1);
 }
 static void divider(float x, float y, float w) { line(x, y, x + w, y, tone(), 0.07f, 1); }
-static void section(LPCWSTR name, float x, float *y, float w) {
-    text(name, F_TINY, rc(x + 2, *y + 2, w, 16), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    *y += LABEL;
-}
-static void hoverFill(int id, D2D1_RECT_F r) {
-    if (hover == id) fillRound(rc(r.left + 3, r.top + 3, r.right - r.left - 6, r.bottom - r.top - 6), 6, tone(), 0.05f);
-}
 // A title on the left, a switch on the right. The whole row is the click target. The title has to say what the switch
-// does on its own: rows have one line. indent sets a row under the switch it depends on.
-static void toggleRow(LPCWSTR label, float x, float y, float w, float indent, int id, BOOL on, BOOL enabled) {
-    float a = enabled ? 1 : 0.4f;
-    if (enabled) {
-        hit[id] = rc(x, y, w, ROW);
-        hoverFill(id, hit[id]);
+// does on its own: rows have one line.
+static void toggleRow(LPCWSTR label, float x, float y, float w, int id, BOOL on) {
+    D2D1_RECT_F r = rc(x + w - INSET - 40, y + 10, 40, 20);
+    hit[id] = rc(x, y, w, ROW);
+    if (hover == id) fillRound(rc(x + 3, y + 3, w - 6, ROW - 6), 6, tone(), 0.05f);
+    text(label, F_ROW, rc(x + INSET, y + 10, w - 80, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    if (on) {
+        fillRound(r, 10, ACCENT, hover == id ? 0.85f : 1);
+        dot(r.left + 30, y + 20, 6, 0xFFFFFF, 1);
+    } else {
+        fillRound(r, 10, tone(), hover == id ? 0.10f : 0.04f);
+        strokeRound(r, 10, dim(), 0.9f, 1);
+        dot(r.left + 10, y + 20, 5, dim(), 1);
     }
-    text(label, F_ROW, rc(x + INSET + indent, y + 10, w - 80 - indent, 22), ink(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
-    toggle(x + w - INSET - 40, y + 10, on, hover == id, enabled);
+}
+// One of the inputs that may wake the screens, as a pill with its picture, 28 px high. Chosen is a red outline and a
+// red tint, not solid red: that is kept for Screens off, the one action here. While the rule above it is off the pill
+// is grey and not a target, but still shows the choice. Returns its width.
+static float pill(int id, LPCWSTR label, float x, float y, BOOL on, BOOL live) {
+    float tw = measure(label, F_SMALL), w = 36 + tw + 14, a = live ? 1 : 0.45f;
+    D2D1_RECT_F r = rc(x, y, w, 28), edge = rc(x + 0.5f, y + 0.5f, w - 1, 27);
+    UINT c = on ? ink() : dim();
+    if (live) hit[id] = r;
+    if (on && live) {
+        fillRound(r, 14, ACCENT, hover == id ? 0.30f : 0.20f);
+        strokeRound(edge, 13.5f, ACCENT, 1, 1);
+    } else {
+        fillRound(r, 14, tone(), on || hover == id ? 0.10f : 0.04f);
+        if (!on) strokeRound(edge, 13.5f, dim(), 0.9f * a, 1);
+    }
+    if (id == H_WAKE_CLICK) mouseIcon(x + 19, y + 14, c, a);
+    else keyboardIcon(x + 20, y + 14, c, a);
+    text(label, F_SMALL, rc(x + 36, y + 6, tw + 2, 16), c, a, DWRITE_TEXT_ALIGNMENT_LEADING);
+    return w;
 }
 
 // ---- Layout ----
 
-static float mainHeight(void) { return PAD + 32 + GAP + 2 * ROW + PAD; }
-static float viewHeight(void) { return view == V_MAIN ? mainHeight() : SET_H; }
-
-// ---- Views ----
-
-static void paintHeader(float x, float y, float w) {
-    if (view == V_MAIN) {
-        moon(x + 9, y + 16, 9);
-        text(L"Blackout", F_BRAND, rc(x + 26, y + 5, 150, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        hit[H_SCREENS] = rc(x + w - 128, y, 128, 32);
-        fillRound(hit[H_SCREENS], 16, ACCENT, hover == H_SCREENS ? 0.85f : 1);
-        powerIcon(x + w - 110, y + 17, 0xFFFFFF);
-        text(L"Screens off", F_BOLD, rc(x + w - 98, y + 7, 92, 18), 0xFFFFFF, 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        hit[H_GEAR] = rc(x + w - 128 - 8 - 32, y, 32, 32);
-        if (hover == H_GEAR) dot(hit[H_GEAR].left + 16, y + 16, 16, tone(), 0.10f);
-        gear(hit[H_GEAR].left + 16, y + 16, hover == H_GEAR ? ink() : dim());
-    } else {
-        hit[H_BACK] = rc(x - 4, y, 32, 32);
-        if (hover == H_BACK) dot(x + 12, y + 16, 16, tone(), 0.10f);
-        chevronLeft(x + 12, y + 16, ink());
+// What Blackout drives on this PC. Only parts that are set up are listed, so with nothing set up nothing is shown.
+// A part has one way to fail, and then its value says which.
+typedef struct { LPCWSTR label, value; BOOL bad; } Part;
+static int partsList(Part *p) {
+    static WCHAR leds[16];
+    int n = 0;
+    if (openrgb[0]) p[n++] = (Part){L"OpenRGB", hasOpenRgb ? L"" : L"not found at the path in blackout.ini", !hasOpenRgb};
+    if (linkLeds) {
+        wsprintfW(leds, L"%d LEDs", linkLeds);
+        p[n++] = (Part){L"iCUE LINK", linkOk ? leds : L"hub not answering", !linkOk};
     }
+    if (hasRam) p[n++] = (Part){L"FURY RAM", L"", FALSE};
+    if (ddcIds[0]) p[n++] = (Part){L"Monitor power", ddcIds, FALSE};
+    return n;
 }
-
-static void paintTabs(float x, float y, float w) {
-    static const LPCWSTR names[2] = {L"Wake", L"System"};
-    float sw = (w - 6) / 2;
-    fillRound(rc(x, y, w, 32), 8, tone(), 0.06f);
-    for (int i = 0; i < 2; i++) {
-        int id = H_TAB_WAKE + i;
-        BOOL on = view == V_WAKE + i;
-        D2D1_RECT_F r = rc(x + 3 + i * sw, y + 3, sw, 26);
-        hit[id] = rc(r.left, y, sw, 32);
-        if (on) fillRound(r, 6, 0xFFFFFF, panelLight ? 0.9f : 0.13f);
-        else if (hover == id) fillRound(r, 6, tone(), 0.06f);
-        text(names[i], on ? F_BOLD : F_ROW, rc(r.left, y + (on ? 7 : 6), sw, 20), on || hover == id ? ink() : dim(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
-    }
-}
-
-static void paintMain(float x, float y, float w) {
-    card(x, y, w, 2 * ROW);
-    toggleRow(L"RGB lighting", x, y, w, 0, H_RGB, panelTest ? pref(L"RgbOn", 1) : rgbShown(), TRUE);
-    divider(x, y + ROW, w);
-    toggleRow(L"RGB off with the screens", x, y + ROW, w, 0, H_SYNC, pref(L"Sync", 1), TRUE);
-}
-
-static void paintWake(float x, float y, float w) {
-    WCHAR s[96];
-    float ix = x + INSET, iw = w - 2 * INSET;
-    BOOL hk = pref(L"HotkeyMode", 0);
-    // The title is the start of a sentence that the rows under it finish: wake the screens only with a left-click,
-    // with Esc, and (always, so it is a word and not a switch) with Ctrl+Alt+Del.
-    card(x, y, w, 4 * ROW);
-    toggleRow(L"Wake the screens only with", x, y, w, 0, H_HOTKEY, hk, TRUE);
-    divider(x, y + ROW, w);
-    toggleRow(L"Left-click", x, y + ROW, w, 16, H_WAKE_CLICK, pref(L"WakeClick", 1), hk);
-    divider(x, y + 2 * ROW, w);
-    toggleRow(L"Esc", x, y + 2 * ROW, w, 16, H_WAKE_ESC, pref(L"WakeEsc", 1), hk);
-    divider(x, y + 3 * ROW, w);
-    text(L"Ctrl+Alt+Del", F_ROW, rc(ix + 16, y + 3 * ROW + 10, iw - 100, 22), ink(), hk ? 1 : 0.4f, DWRITE_TEXT_ALIGNMENT_LEADING);
-    text(L"always", F_SMALL, rc(ix + iw - 80, y + 3 * ROW + 11, 80, 18), dim(), hk ? 1 : 0.4f, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    y += 4 * ROW + SECT;
-
-    section(L"WHAT WOKE THE SCREENS", x, &y, w);
-    float h = panelH - PAD - y;
-    card(x, y, w, h);
-    if (!wakeCount) {
-        text(L"Nothing yet", F_ROW, rc(ix, y + h / 2 - 11, iw, 22), ink(), 0.7f, DWRITE_TEXT_ALIGNMENT_CENTER);
-        return;
-    }
-    float rh = (h - 12) / MAX_WAKES;
-    for (int i = 0; i < wakeCount; i++) {
-        float ry = y + 6 + i * rh;
-        if (i) divider(ix, ry, iw);
-        wsprintfW(s, L"%02d:%02d", wakes[i].at.wHour, wakes[i].at.wMinute);
-        text(s, F_BOLD, rc(ix, ry + rh / 2 - 9, 44, 18), ink(), i ? 0.7f : 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-        // The cause as a picture: what kind of input, the device's name, and the bracketed remark set apart on the
-        // right ("not blocked" is the one that matters, so it must never be the part that gets cut off).
-        WCHAR *name = s, *tag;
-        float cy = ry + rh / 2, tw = 0;
-        lstrcpyW(s, wakes[i].cause);
-        if ((tag = wcsstr(s, L" ("))) {
-            *tag = 0, tag += 2;
-            if (tag[0] && tag[lstrlenW(tag) - 1] == L')') tag[lstrlenW(tag) - 1] = 0;
-            BOOL slip = tag[0] == L'n'; // "not blocked": input got past Hotkey mode
-            tw = measure(tag, F_TINY) + 8;
-            text(tag, F_TINY, rc(ix + iw - tw, cy - 7, tw, 14), slip ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
+// The parts flow like words and wrap: a dot, the name, and what the dot cannot say. Returns the height used, and
+// only measures when draw is not set.
+static float partsFlow(float x, float y, float w, BOOL draw) {
+    Part p[4];
+    int n = partsList(p);
+    float cx = x, cy = y;
+    for (int i = 0; i < n; i++) {
+        float lw = measure(p[i].label, F_SMALL), vw = p[i].value[0] ? measure(p[i].value, F_SMALL) + 5 : 0;
+        if (cx > x && cx + 12 + lw + vw > x + w) cx = x, cy += LINE;
+        if (12 + lw + vw > w) vw = w - 12 - lw; // a part longer than a line ends in an ellipsis
+        if (draw) {
+            dot(cx + 4, cy + 11, 3.5f, p[i].bad ? warn() : good(), 1);
+            text(p[i].label, F_SMALL, rc(cx + 12, cy + 3, lw + 2, 16), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+            if (vw) text(p[i].value, F_SMALL, rc(cx + 17 + lw, cy + 3, vw - 3, 16), p[i].bad ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
         }
-        if (s[0] == L'M' || s[0] == L'L') mouseIcon(ix + 56, cy, i ? dim() : ink(), 1);
-        else if (s[0] == L'K' || s[0] == L'E') keyboardIcon(ix + 56, cy, i ? dim() : ink(), 1);
-        else ring(ix + 56, cy, 4, dim(), 0.7f, 1.3f);
-        if (!wcsncmp(s, L"Mouse: ", 7)) name += 7;
-        else if (!wcsncmp(s, L"Keyboard: ", 10)) name += 10;
-        text(name, F_SMALL, rc(ix + 72, cy - 8, iw - 72 - tw, 18), i ? dim() : ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        cx += 12 + lw + vw + 16;
     }
+    return n ? cy - y + LINE : 0;
+}
+static float logHeight(void) { return wakeCount ? LABEL + wakeCount * LOG + 6 : 0; }
+static float partsHeight(void) {
+    float h = partsFlow(0, 0, PANEL_W - 2 * PAD - 4, FALSE);
+    return h ? h + 4 : 0;
+}
+static float panelHeight(void) {
+    return PAD + 32 + GAP + (hasRgb ? 2 * ROW + GAP : 0) + 2 * ROW + logHeight() + GAP + ROW + 10 + partsHeight() + 28 + PAD - 4;
 }
 
-// The value takes all the room the label leaves, and ends in an ellipsis if even that is not enough.
-static void statusRow(LPCWSTR label, LPCWSTR value, int state, float x, float y, float w) {
-    float lw = measure(label, F_SMALL) + 16 + 12;
-    if (state >= 0) dot(x + INSET + 4, y + 14, 3.5f, state == 2 ? GOOD : state == 1 ? warn() : dim(), state ? 1 : 0.5f);
-    text(label, F_SMALL, rc(x + INSET + 16, y + 6, 120, 18), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    text(value, F_SMALL, rc(x + INSET + lw, y + 6, w - 2 * INSET - lw, 18), state == 1 ? warn() : dim(), 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
-}
+// ---- The view ----
 
-static void paintSystem(float x, float y, float w) {
-    WCHAR s[96];
-    float ix = x + INSET, iw = w - 2 * INSET;
-    card(x, y, w, 2 * ROW);
-    toggleRow(L"Start with Windows", x, y, w, 0, H_START, panelTest ? pref(L"Start", 1) : startupEnabled(), TRUE);
-    divider(x, y + ROW, w);
-    hit[H_EXIT] = rc(x, y + ROW, w, ROW);
-    hoverFill(H_EXIT, hit[H_EXIT]);
-    text(L"Exit Blackout", F_ROW, rc(ix, y + ROW + 10, iw, 22), ACCENT, 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    y += 2 * ROW + GAP;
-
-    float rh = (panelH - PAD - y - 8) / 5;
-    card(x, y, w, panelH - PAD - y);
-    y += 4 + (rh - 28) / 2;
-    wsprintfW(s, L"%d LEDs", linkLeds);
-    statusRow(L"Pump lighting", !linkLeds ? L"Not set up" : linkOk ? s : L"Hub not answering", !linkLeds ? 0 : linkOk ? 2 : 1, x, y, w);
-    statusRow(L"OpenRGB", hasOpenRgb ? L"Found" : openrgb[0] ? L"Not found at the path in blackout.ini" : L"Not set up", hasOpenRgb ? 2 : openrgb[0] ? 1 : 0, x, y + rh, w);
-    statusRow(L"RAM lighting", hasRam ? L"FURY module" : L"Not installed", hasRam ? 2 : 0, x, y + 2 * rh, w);
-    statusRow(L"Monitor power", ddcIds[0] ? ddcIds : L"Not set up", ddcIds[0] ? 2 : 0, x, y + 3 * rh, w);
-    statusRow(L"Blackout", VERSION, -1, x, y + 4 * rh, w);
-}
-
-static void paintPanel(void) {
-    float x = PAD, w = PANEL_W - 2 * PAD, y = PAD;
+static void paintBackground(void) {
     D2D1_COLOR_F clear = {0, 0, 0, 0};
     ID2D1PathGeometry *g;
     ID2D1GeometrySink *sink;
     float r = RADIUS, W = PANEL_W, H = panelH;
     ID2D1RenderTarget_Clear(rt, &clear);
-    // Background: one opaque shape, square where it meets the taskbar and the screen edge, rounded at the corner that
-    // faces the desktop. The window is layered, so the curve is anti-aliased against whatever is behind it.
+    // One opaque shape, square where it meets the taskbar and the screen edge, rounded at the corner that faces the
+    // desktop. The window is layered, so the curve is anti-aliased against whatever is behind it.
     if (ID2D1Factory_CreatePathGeometry(d2f, &g) == S_OK) {
         if (ID2D1PathGeometry_Open(g, &sink) == S_OK) {
             D2D1_ARC_SEGMENT corner = {{dockTop ? 0 : r, dockTop ? H - r : 0}, {r, r}, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL};
@@ -440,18 +325,75 @@ static void paintPanel(void) {
         }
         ID2D1PathGeometry_Release(g);
     }
-    memset(hit, 0, sizeof(hit));
-    paintHeader(x, y, w);
-    y += 32;
-    if (view == V_MAIN) {
-        paintMain(x, y + GAP, w);
-        return;
+}
+
+// The log of what woke the screens. A row is a picture of one wake: the time, what kind of input (mouse, keyboard,
+// neither), the device, and "not blocked" set apart on the right when it got past the wake rules, so that is never
+// the part that gets cut off.
+static void paintLog(float x, float y, float w) {
+    WCHAR at[8];
+    float tw = measure(L"not blocked", F_TINY) + 8;
+    text(L"WHAT WOKE THE SCREENS", F_TINY, rc(x, y + 9, w, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    y += LABEL;
+    for (int i = 0; i < wakeCount; i++, y += LOG) {
+        float cy = y + LOG / 2;
+        wsprintfW(at, L"%02d:%02d", wakes[i].at.wHour, wakes[i].at.wMinute);
+        text(at, F_BOLD, rc(x, cy - 9, 40, 18), ink(), i ? 0.7f : 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (wakes[i].icon == L'M') mouseIcon(x + 52, cy, i ? dim() : ink(), 1);
+        else if (wakes[i].icon == L'K') keyboardIcon(x + 52, cy, i ? dim() : ink(), 1);
+        else ring(x + 52, cy, 4, dim(), 0.7f, 1.3f);
+        if (wakes[i].slip) text(L"not blocked", F_TINY, rc(x + w - tw, cy - 7, tw, 14), warn(), 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        text(wakes[i].name, F_SMALL, rc(x + 68, cy - 8, w - 68 - (wakes[i].slip ? tw : 0), 18), i ? dim() : ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     }
-    // Settings has no title row: the tabs say where you are, and the back arrow sits beside them.
-    paintTabs(x + 36, y - 32, w - 36);
-    y += GAP;
-    if (view == V_WAKE) paintWake(x, y, w);
-    else paintSystem(x, y, w);
+}
+
+static void paintPanel(void) {
+    float x = PAD, w = PANEL_W - 2 * PAD, y = PAD, ix = x + INSET, iw = w - 2 * INSET;
+    paintBackground();
+    memset(hit, 0, sizeof(hit));
+
+    moon(x + 9, y + 16, 9);
+    text(L"Blackout", F_BRAND, rc(x + 26, y + 5, 150, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    hit[H_SCREENS] = rc(x + w - 128, y, 128, 32);
+    fillRound(hit[H_SCREENS], 16, ACCENT, hover == H_SCREENS ? 0.85f : 1);
+    powerIcon(x + w - 110, y + 17, 0xFFFFFF);
+    text(L"Screens off", F_BOLD, rc(x + w - 98, y + 7, 92, 18), 0xFFFFFF, 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    y += 32 + GAP;
+
+    if (hasRgb) {
+        card(x, y, w, 2 * ROW);
+        toggleRow(L"RGB lighting", x, y, w, H_RGB, litWant);
+        divider(x, y + ROW, w);
+        toggleRow(L"RGB off with the screens", x, y + ROW, w, H_SYNC, syncOn);
+        y += 2 * ROW + GAP;
+    }
+
+    // The title starts a sentence that the row under it finishes, so no line divides them: wake the screens only with
+    // a left-click, with Esc, and (always, so it is words and not a pill) with Ctrl+Alt+Del.
+    float lh = logHeight(), aw = measure(L"always", F_SMALL), cw = measure(L"Ctrl+Alt+Del", F_SMALL), a = hotkeyOn ? 1 : 0.45f;
+    card(x, y, w, 2 * ROW + lh);
+    toggleRow(L"Wake the screens only with", x, y, w, H_HOTKEY, hotkeyOn);
+    float px = ix + pill(H_WAKE_CLICK, L"Left-click", ix, y + ROW + 2, wakeClick, hotkeyOn) + 8;
+    pill(H_WAKE_ESC, L"Esc", px, y + ROW + 2, wakeEsc, hotkeyOn);
+    text(L"Ctrl+Alt+Del", F_SMALL, rc(ix + iw - aw - 5 - cw, y + ROW + 8, cw + 2, 16), ink(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
+    text(L"always", F_SMALL, rc(ix + iw - aw, y + ROW + 8, aw + 2, 16), dim(), a, DWRITE_TEXT_ALIGNMENT_LEADING);
+    if (lh) {
+        divider(x, y + 2 * ROW, w);
+        paintLog(ix, y + 2 * ROW, iw);
+    }
+    y += 2 * ROW + lh + GAP;
+
+    card(x, y, w, ROW);
+    toggleRow(L"Start with Windows", x, y, w, H_START, startOn);
+    y += ROW + 10;
+
+    // The foot of the panel is about Blackout itself: what it drives on this PC, its version, and the way out.
+    partsFlow(x + 2, y, w - 4, TRUE);
+    y += partsHeight();
+    text(L"Blackout " VERSION, F_TINY, rc(x + 2, y + 7, 160, 14), dim(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    hit[H_EXIT] = rc(x + w - 56, y, 56, 28);
+    fillRound(hit[H_EXIT], 6, tone(), hover == H_EXIT ? 0.12f : 0.05f);
+    text(L"Exit", F_SMALL, rc(x + w - 56, y + 6, 56, 16), hover == H_EXIT ? ink() : dim(), 1, DWRITE_TEXT_ALIGNMENT_CENTER);
 }
 
 // ---- Resources and rendering ----
@@ -479,8 +421,6 @@ static BOOL panelLoad(void) {
         {L"Segoe UI Variable Display", DWRITE_FONT_WEIGHT_SEMI_BOLD, 15},
         {L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_NORMAL, 13.5f},
         {L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_NORMAL, 11.5f},
-        {L"Segoe UI Variable Display", DWRITE_FONT_WEIGHT_SEMI_BOLD, 30},
-        {L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_NORMAL, 15},
         {L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_SEMI_BOLD, 13},
         {L"Segoe UI Variable Text", DWRITE_FONT_WEIGHT_NORMAL, 10.5f},
     };
@@ -508,7 +448,7 @@ static BOOL panelLoad(void) {
     return ok;
 }
 
-// The bitmap the panel is drawn into, remade when the view changes height.
+// The bitmap the panel is drawn into, remade when the panel changes height.
 static BOOL panelSurface(int w, int h) {
     if (surfDc && w == surfW && h == surfH) return TRUE;
     if (surfDc) {
@@ -530,7 +470,7 @@ static BOOL panelSurface(int w, int h) {
     return TRUE;
 }
 
-// Draws the current view on the CPU and, when there is a window, hands the bitmap to it. pos moves the window too.
+// Draws the panel on the CPU and, when there is a window, hands the bitmap to it. pos moves the window too.
 static BOOL panelRender(POINT *pos) {
     D2D1_RENDER_TARGET_PROPERTIES p = {D2D1_RENDER_TARGET_TYPE_SOFTWARE, {DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED},
                                        96 * panelScale, 96 * panelScale, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT};
@@ -566,6 +506,7 @@ static BOOL panelRender(POINT *pos) {
 static void panelDirty(void) {
     if (panel && !dirty) dirty = TRUE, PostMessageW(panel, WM_RENDER, 0, 0);
 }
+static void panelUpdate(void) { panelDirty(); }
 
 // ---- Interaction ----
 
@@ -576,15 +517,10 @@ static int hitTest(LPARAM lp) {
     return H_NONE;
 }
 
-// Switch view. The window only changes size between Main and Settings, and only when their heights differ.
-static void panelGo(int to) {
-    RECT r;
-    view = to, hover = H_NONE;
-    if (to != V_MAIN) settingsTab = to;
-    GetWindowRect(panel, &r);
-    panelH = viewHeight();
-    POINT pos = {r.left, dockTop ? r.top : r.bottom - (int)(panelH * panelScale + 0.5f)};
-    panelRender(&pos);
+// A switch is cached in memory (blackout.c) and written through to HKCU, except in the developer modes.
+static void flip(BOOL *value, LPCWSTR name) {
+    *value = !*value;
+    if (!panelTest) setDword(name, *value);
 }
 
 static void panelClick(int id) {
@@ -594,31 +530,23 @@ static void panelClick(int id) {
         DestroyWindow(panel);
         if (!panelTest) SetTimer(panelOwner, TIMER_OFF, 400, NULL);
         return;
-    case H_GEAR: panelGo(settingsTab); return;
-    case H_BACK: panelGo(V_MAIN); return;
-    case H_TAB_WAKE:
-    case H_TAB_SYSTEM: panelGo(V_WAKE + id - H_TAB_WAKE); return;
-    case H_RGB:
-        if (panelTest) setPref(L"RgbOn", !pref(L"RgbOn", 1));
-        else rgbToggle(panelOwner);
-        break;
-    case H_SYNC: setPref(L"Sync", !pref(L"Sync", 1)); break;
-    case H_START:
-        if (panelTest) setPref(L"Start", !pref(L"Start", 1));
-        else toggleStartup();
-        break;
-    case H_HOTKEY: setPref(L"HotkeyMode", !pref(L"HotkeyMode", 0)); break;
-    case H_WAKE_CLICK:
-    case H_WAKE_ESC: {
-        LPCWSTR key = id == H_WAKE_CLICK ? L"WakeClick" : L"WakeEsc", other = id == H_WAKE_CLICK ? L"WakeEsc" : L"WakeClick";
-        // Keep at least one wake input, so the screens can always be woken.
-        if (!pref(key, 1) || pref(other, 1)) setPref(key, !pref(key, 1));
-        break;
-    }
     case H_EXIT:
         DestroyWindow(panel);
         if (!panelTest) DestroyWindow(panelOwner);
         return;
+    case H_RGB:
+        if (panelTest) litWant = !litWant;
+        else rgbToggle(panelOwner);
+        break;
+    case H_SYNC: flip(&syncOn, L"Sync"); break;
+    case H_HOTKEY: flip(&hotkeyOn, L"HotkeyMode"); break;
+    // Keep at least one wake input, so the screens can always be woken.
+    case H_WAKE_CLICK: if (!wakeClick || wakeEsc) flip(&wakeClick, L"WakeClick"); break;
+    case H_WAKE_ESC: if (!wakeEsc || wakeClick) flip(&wakeEsc, L"WakeEsc"); break;
+    case H_START:
+        if (!panelTest) toggleStartup();
+        startOn = panelTest ? !startOn : startupEnabled();
+        break;
     }
     panelDirty();
 }
@@ -631,10 +559,21 @@ static LRESULT CALLBACK panelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         EndPaint(hwnd, &ps);
         return 0;
     }
-    case WM_RENDER:
+    case WM_RENDER: {
+        // The height follows what there is to show (a wake was logged, the hub stopped answering): the edge that
+        // touches the taskbar stays where it is.
+        float h = panelHeight();
+        RECT r;
         dirty = FALSE;
-        panelRender(NULL);
+        if (h == panelH || !GetWindowRect(hwnd, &r)) {
+            panelRender(NULL);
+            return 0;
+        }
+        panelH = h;
+        POINT pos = {r.left, dockTop ? r.top : r.bottom - (int)(panelH * panelScale + 0.5f)};
+        panelRender(&pos);
         return 0;
+    }
     case WM_ERASEBKGND: return 1;
     case WM_NCCALCSIZE: if (wp) return 0; break;
     case WM_NCHITTEST: return HTCLIENT;
@@ -654,19 +593,12 @@ static LRESULT CALLBACK panelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         panelClick(hitTest(lp));
         return 0;
     case WM_SETCURSOR: return TRUE;
-    case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) {
-            if (view != V_MAIN) panelGo(V_MAIN);
-            else DestroyWindow(hwnd);
-        } else if (view != V_MAIN && (wp == VK_LEFT || wp == VK_RIGHT)) {
-            panelGo(view == V_WAKE ? V_SYSTEM : V_WAKE);
-        }
-        return 0;
+    case WM_KEYDOWN: if (wp == VK_ESCAPE) DestroyWindow(hwnd); return 0;
     case WM_ACTIVATE: if (LOWORD(wp) == WA_INACTIVE) DestroyWindow(hwnd); return 0;
     case WM_DESTROY:
         panelFree();
         panel = NULL;
-        hover = H_NONE, view = V_MAIN, dirty = FALSE;
+        hover = H_NONE, dirty = FALSE;
         panelClosedAt = GetTickCount();
         if (panelTest && !panelHidden) PostQuitMessage(0);
         trim();
@@ -674,8 +606,6 @@ static LRESULT CALLBACK panelProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
-
-static void panelUpdate(void) { panelDirty(); }
 
 // Opens the panel docked to the taskbar. Returns FALSE (caller falls back to the plain menu) if Direct2D is unavailable.
 static BOOL panelShow(HWND owner) {
@@ -697,8 +627,12 @@ static BOOL panelShow(HWND owner) {
         registered = RegisterClassW(&wc) != 0;
     }
     panelOwner = owner;
-    view = V_MAIN;
-    if (!panelTest) panelLight = getDwordAt(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"SystemUsesLightTheme", 0);
+    if (!panelTest) {
+        DWORD light = 0, n = sizeof(light);
+        RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"SystemUsesLightTheme", RRF_RT_REG_DWORD, NULL, &light, &n);
+        panelLight = light != 0;
+        startOn = startupEnabled();
+    }
     // The monitor that holds the tray icon; dock to its taskbar and right edge.
     NOTIFYICONIDENTIFIER id = {sizeof(id), nid.hWnd, nid.uID, {0}};
     RECT icon;
@@ -719,7 +653,7 @@ static BOOL panelShow(HWND owner) {
     // Dock against the taskbar's own rectangle on this monitor. The work area is not used unless there is no taskbar
     // here: Windows sometimes reports it as the whole screen after a display change, which put the panel over the taskbar.
     RECT wa = mi.rcWork, bar;
-    HWND tray = FindWindowW(L"Shell_TrayWnd", NULL), next = NULL;
+    HWND tray = shell, next = NULL;
     if (tray && MonitorFromWindow(tray, MONITOR_DEFAULTTONULL) != mon) tray = NULL;
     while (!tray && (next = FindWindowExW(NULL, next, L"Shell_SecondaryTrayWnd", NULL)))
         if (MonitorFromWindow(next, MONITOR_DEFAULTTONULL) == mon) tray = next;
@@ -737,7 +671,6 @@ static BOOL panelShow(HWND owner) {
     }
     // Take the panel's colour from the taskbar it docks to, unchanged, so it reads as part of the same surface on
     // any wallpaper, accent colour or transparency setting. One row of taskbar pixels, per-channel median.
-    DWORD tint = 0;
     panelTint = 0;
     if (docked) {
         int w = bar.right - bar.left > 512 ? 512 : bar.right - bar.left, hist[3][256] = {{0}};
@@ -750,29 +683,21 @@ static BOOL panelShow(HWND owner) {
         SelectObject(mem, old);
         if (ok && GetDIBits(mem, bmp, 0, 1, row, &bi, DIB_RGB_COLORS)) {
             for (int i = 0; i < w; i++)
-                for (int c = 0; c < 3; c++) hist[c][(row[i] >> (16 - 8 * c)) & 255]++;
-            int med[3], luma;
+                for (int c = 0; c < 3; c++) hist[c][(row[i] >> (16 - 8 * c)) & 255]++; // c = 0 is red
             for (int c = 0; c < 3; c++) {
-                int seen = 0;
-                med[c] = 0;
-                while (med[c] < 255 && (seen += hist[c][med[c]]) * 2 < w) med[c]++;
+                int seen = 0, med = 0;
+                while (med < 255 && (seen += hist[c][med]) * 2 < w) med++;
+                panelTint = panelTint << 8 | (UINT)med;
             }
-            luma = (med[0] * 3 + med[1] * 6 + med[2]) / 10;
-            for (int c = 0; c < 3; c++) {
-                int v = (med[c] * (100 - grey) + luma * grey) / 100 * shade / 100;
-                tint |= (DWORD)(v > 255 ? 255 : v) << (8 * c); // AABBGGRR: c = 0 is red
-            }
-            panelTint = (tint & 255) << 16 | (tint & 0xFF00) | (tint >> 16 & 255);
         }
         DeleteObject(bmp);
         DeleteDC(mem);
         ReleaseDC(NULL, screen);
     }
     panelScale = dpiX / 96.0f;
-    // Small or heavily scaled screens: shrink the whole panel so the tallest view still fits.
-    float tallest = mainHeight() > SET_H ? mainHeight() : SET_H;
-    if (tallest * panelScale > wa.bottom - wa.top) panelScale = (wa.bottom - wa.top) / tallest;
-    panelH = viewHeight();
+    panelH = panelHeight();
+    // Small or heavily scaled screens: shrink the whole panel so it still fits.
+    if (panelH * panelScale > wa.bottom - wa.top) panelScale = (wa.bottom - wa.top) / panelH;
     int pw = (int)(PANEL_W * panelScale + 0.5f), ph = (int)(panelH * panelScale + 0.5f);
     dockTop = wa.top > mi.rcMonitor.top; // taskbar at the top
     int px = wa.right - pw, py = dockTop ? wa.top : wa.bottom - ph;
@@ -797,11 +722,15 @@ static BOOL panelShow(HWND owner) {
     return TRUE;
 }
 
-// ---- Developer modes (no hardware access, no single-instance lock) ----
+// ---- Developer modes ----
+// No hardware access, no single-instance lock, blackout.ini and the registry are neither read nor written: what is
+// set up comes from the flags, so a picture never depends on the PC that drew it. With no flags: nothing set up.
 //   --panel-test  [flags]              open the panel with preview data; exits on close
-//   --panel-shot  [flags] out=<file>   draw one view off-screen to a .bmp, no window at all (README images, reviews)
-//   --panel-bench                      open and close five times, never shown; log time and memory to %TEMP%
-// Flags: wake system | light top | x2 scale=<percent> | hotkey wakes longwakes rgboff longstatus | hover=<id>
+//   --panel-shot  [flags] out=<file>   draw the panel off-screen to a .bmp, no window at all (README images, reviews)
+//   --panel-bench [flags]              open and close five times, never shown; log time and memory to %TEMP%
+// Set up:  openrgb badpath link nohub ram ddc longddc all (= openrgb link ram ddc)
+// State:   rgboff nosync hotkey noclick noesc nostart wakes=<1..5> longwakes
+// Picture: light top x2 scale=<percent> hover=<id>
 
 static BOOL flag(LPCWSTR cmd, LPCWSTR name) {
     WCHAR key[32] = L" ";
@@ -813,7 +742,7 @@ static BOOL flag(LPCWSTR cmd, LPCWSTR name) {
 static BOOL panelShot(LPCWSTR path) {
     DWORD wrote;
     if (!panelLoad()) return FALSE;
-    panelH = viewHeight();
+    panelH = panelHeight();
     BOOL ok = panelRender(NULL);
     if (ok) {
         BITMAPINFOHEADER info = {sizeof(info), surfW, -surfH, 1, 32, BI_RGB, (DWORD)(surfW * surfH * 4), 0, 0, 0, 0};
@@ -840,7 +769,7 @@ static void benchLine(HANDLE f, LPCSTR stage, int ms) {
     GetProcessHandleCount(GetCurrentProcess(), &handles);
     int n = wsprintfA(out, "%-16s private %5u KB  working set %5u KB  handles %3u  open %3d ms  loaded:%s%s%s%s\r\n", stage, (UINT)(m.PrivateUsage / 1024),
                       (UINT)(m.WorkingSetSize / 1024), handles, ms, GetModuleHandleW(L"d2d1.dll") ? " d2d1" : "", GetModuleHandleW(L"dwrite.dll") ? " dwrite" : "",
-                      GetModuleHandleW(L"d3d10warp.dll") ? " warp" : "", GetModuleHandleW(L"nvwgf2umx.dll") || GetModuleHandleW(L"nvldumdx.dll") ? " gpu-driver" : "");
+                      GetModuleHandleW(L"d3d10warp.dll") ? " warp" : "", GetModuleHandleW(L"nvwgf2umx.dll") || GetModuleHandleW(L"nvldumdx.dll") ? " graphics-driver" : "");
     WriteFile(f, out, n, &w, NULL);
 }
 
@@ -873,58 +802,45 @@ static void panelBench(void) {
 }
 
 static int panelDev(LPWSTR cmd) {
-    WCHAR fury[MAX_PATH];
+    // The everyday wakes, and the longest wakeRecord() can write: 40 character product names, with and without
+    // "not blocked".
+    static const struct { WCHAR icon; LPCWSTR name; BOOL slip; } usual[MAX_WAKES] = {
+        {L'M', L"Left-click", 0}, {L'M', L"PRO X SUPERLIGHT 2c", 0}, {0, L"No input: Windows or an app", 0}, {L'K', L"Esc", 0}, {L'K', L"BlackWidow V4 75%", 1}},
+    longest[MAX_WAKES] = {{L'K', L"Razer BlackWidow V4 Pro 75% Wireless Keyb", 1}, {L'M', L"Logitech G502 X PLUS LIGHTSPEED Wireless", 1},
+                          {0, L"Input device: USB Composite Device Receiver 2.4G Wireless", 0}, {L'K', L"Esc", 0}, {0, L"No input: Windows or an app", 0}};
     LPCWSTR out = wcsstr(cmd, L"out="), at;
+    BOOL all = flag(cmd, L"all"), longWakes = flag(cmd, L"longwakes");
     MSG m;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    loadConfig();
     panelTest = TRUE;
-    panelLight = flag(cmd, L"light");
-    exeDir(fury, L"furyled.exe");
-    hasOpenRgb = openrgb[0] && GetFileAttributesW(openrgb) != INVALID_FILE_ATTRIBUTES;
-    hasRam = GetFileAttributesW(fury) != INVALID_FILE_ATTRIBUTES;
-    linkOk = !flag(cmd, L"longstatus");
-    if (flag(cmd, L"longstatus")) {
-        lstrcpyW(ddcIds, L"BNQ7F2F,DELA0EC,GSM5B7F,AUS27B1");
-        lstrcpyW(openrgb, L"C:\\missing\\OpenRGB.exe"), linkLeds = 22;
+    if (flag(cmd, L"badpath") || (hasOpenRgb = all || flag(cmd, L"openrgb"))) lstrcpyW(openrgb, L"OpenRGB.exe");
+    linkOk = all || flag(cmd, L"link");
+    if (linkOk || flag(cmd, L"nohub")) linkLeds = 22;
+    hasRam = all || flag(cmd, L"ram");
+    if (all || flag(cmd, L"ddc")) lstrcpyW(ddcIds, L"BNQ7F2F");
+    if (flag(cmd, L"longddc")) lstrcpyW(ddcIds, L"BNQ7F2F,DELA0EC,GSM5B7F,AUS27B1,SAM7106,ACR0B0C");
+    hasRgb = hasOpenRgb || hasRam || linkLeds;
+    litWant = !flag(cmd, L"rgboff"), syncOn = !flag(cmd, L"nosync"), startOn = !flag(cmd, L"nostart");
+    hotkeyOn = flag(cmd, L"hotkey"), wakeClick = !flag(cmd, L"noclick"), wakeEsc = !flag(cmd, L"noesc");
+    wakeCount = longWakes ? MAX_WAKES : (at = wcsstr(cmd, L"wakes=")) ? _wtoi(at + 6) : 0;
+    if (wakeCount > MAX_WAKES) wakeCount = MAX_WAKES;
+    for (int i = 0; i < wakeCount; i++) {
+        GetLocalTime(&wakes[i].at);
+        wakes[i].at.wHour = (WORD)(longWakes ? 23 - i * 5 : 9 - i * 2), wakes[i].at.wMinute = (WORD)(longWakes ? 48 - i * 9 : 13 + i * 11);
+        wakes[i].icon = (longWakes ? longest : usual)[i].icon, wakes[i].slip = (longWakes ? longest : usual)[i].slip;
+        lstrcpyW(wakes[i].name, (longWakes ? longest : usual)[i].name);
     }
-    // Every switch is faked, so previews and screenshots never depend on (or change) this machine's settings.
-    setPref(L"RgbOn", !flag(cmd, L"rgboff")), setPref(L"Sync", 1), setPref(L"Start", 1);
-    setPref(L"HotkeyMode", flag(cmd, L"hotkey")), setPref(L"WakeClick", 1), setPref(L"WakeEsc", 1);
-    if (flag(cmd, L"wakes")) {
-        static const LPCWSTR why[3] = {L"Left-click", L"Mouse: PRO X SUPERLIGHT 2c", L"No input: Windows or an app"};
-        for (wakeCount = 0; wakeCount < 3; wakeCount++) {
-            GetLocalTime(&wakes[wakeCount].at);
-            wakes[wakeCount].at.wHour = (WORD)(9 - wakeCount * 3), wakes[wakeCount].at.wMinute = (WORD)(13 + wakeCount * 17);
-            lstrcpyW(wakes[wakeCount].cause, why[wakeCount]);
-        }
-    }
-    if (flag(cmd, L"longwakes")) {
-        // The longest causes wakeRecord() can write: a 40 character product name, with and without "(not blocked)".
-        static const LPCWSTR why[MAX_WAKES] = {L"Keyboard: Razer BlackWidow V4 Pro 75% Wireless Ke (not blocked)", L"Mouse: Logitech G502 X PLUS LIGHTSPEED Wireless (not blocked)",
-                                               L"Input device: USB Composite Device Receiver 2.4G", L"Esc", L"No input: Windows or an app"};
-        for (wakeCount = 0; wakeCount < MAX_WAKES; wakeCount++) {
-            GetLocalTime(&wakes[wakeCount].at);
-            wakes[wakeCount].at.wHour = (WORD)(23 - wakeCount * 5), wakes[wakeCount].at.wMinute = (WORD)(48 - wakeCount * 9);
-            lstrcpyW(wakes[wakeCount].cause, why[wakeCount]);
-        }
-    }
-    dockTop = flag(cmd, L"top");
+    panelLight = flag(cmd, L"light"), dockTop = flag(cmd, L"top");
     if ((at = wcsstr(cmd, L"hover="))) hover = _wtoi(at + 6);
-    int to = flag(cmd, L"wake") ? V_WAKE : flag(cmd, L"system") ? V_SYSTEM : V_MAIN;
     if (wcsstr(cmd, L"--panel-bench")) {
         panelBench();
         return 0;
     }
     if (wcsstr(cmd, L"--panel-shot")) {
         panelScale = flag(cmd, L"x2") ? 2 : (at = wcsstr(cmd, L"scale=")) ? _wtoi(at + 6) / 100.0f : 1;
-        view = to;
         return out && panelShot(out + 4) ? 0 : 1;
     }
     if (!panelShow(NULL)) return 1;
-    if (to != V_MAIN) panelGo(to);
-    while (GetMessageW(&m, NULL, 0, 0) > 0) {
-        DispatchMessageW(&m);
-    }
+    while (GetMessageW(&m, NULL, 0, 0) > 0) DispatchMessageW(&m);
     return 0;
 }
