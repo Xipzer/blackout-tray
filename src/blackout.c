@@ -1456,6 +1456,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Sleep: give the headers back to the BIOS. The chip resets on resume, so the next tick takes over afresh.
         if (wp == PBT_APMSUSPEND) fansRelease();
         if (wp == PBT_APMRESUMEAUTOMATIC) fansForget();
+        // The driver starts afresh after sleep too. Sending the profile again costs nothing if it survived.
+        if (wp == PBT_APMRESUMEAUTOMATIC && hasGpu()) SetTimer(hwnd, TIMER_GPU, 10000, NULL);
         if (wp == PBT_POWERSETTINGCHANGE) {
             POWERBROADCAST_SETTING *ps = (POWERBROADCAST_SETTING *)lp;
             if (IsEqualGUID(&ps->PowerSetting, &GUID_CONSOLE_DISPLAY_STATE) && ps->DataLength >= sizeof(DWORD)) {

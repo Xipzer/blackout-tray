@@ -9,7 +9,7 @@ Tested on one card: RTX 5090 Founders Edition, driver 621.24, Windows 11. Treat 
 
 - **These are private driver interfaces.** NVIDIA does not document them. The community worked them out, and a future driver can change or block them. Keep your tuning app installed until you trust this.
 - **Blackout applies a profile, it does not find one.** Tune and stress test in your usual app, then save the result (below).
-- **The driver forgets everything** when it resets (a crash) or the PC restarts. Blackout sends the profile 10 seconds after it starts and 15 seconds after a driver reset.
+- **The driver forgets everything** when it resets (a crash) or the PC restarts. Blackout sends the profile 10 seconds after it starts, 10 seconds after the PC wakes from sleep and 15 seconds after a driver reset.
 - **Writing needs admin.** Reading does not.
 - **Only the first NVIDIA GPU** is used.
 
@@ -19,6 +19,8 @@ Tested on one card: RTX 5090 Founders Edition, driver 621.24, Windows 11. Treat 
 2. Run `blackout.exe --gpu-save 1`. It reads the card and writes `[gpu.1]` to `blackout.ini`. Repeat with `2` to `5` for more profiles.
 3. Optionally add `name=` to each section, and `xbar=0,300,400` under `[gpu]` for the XBAR stepper.
 4. Restart Blackout, then stop your tuning app from starting with Windows.
+
+To carry over several profiles from a tuning app, load each one there and save it under the same number here. To change a profile later, do the same again for that number.
 
 ```ini
 [gpu]
@@ -72,7 +74,7 @@ All through `nvapi_QueryInterface(id)` in `nvapi64.dll`. Sizes are in bytes; the
 Rules that cost us time:
 
 - Read, change, write back. A zeroed buffer is silently ignored.
-- On this card 127 of the 128 used slots are core points. The last one belongs to memory.
+- On this card 127 of the 128 used slots are core points. The other one is not (it reads like a memory point: 405 MHz at 530 mV), so count core points from the type fields, not from the mask.
 - A memory offset set by Afterburner did not show in the memory read above (it read 0 at +3000). Two non-core slots of the curve table held offsets instead, which is our guess at where it lives. `--gpu-save` takes the larger reading.
 - Error -137 means the process is not elevated.
 
