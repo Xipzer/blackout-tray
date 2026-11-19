@@ -346,10 +346,10 @@ static void paintPanel(void) {
 
     moon(x + 9, y + 16, 9);
     text(L"Blackout", F_BRAND, rc(x + 26, y + 5, 150, 22), ink(), 1, DWRITE_TEXT_ALIGNMENT_LEADING);
-    hit[H_SCREENS] = rc(x + w - 128, y, 128, 32);
+    hit[H_SCREENS] = rc(x + w - 116, y, 116, 32); // hugs its content: 16 px each side
     fillRound(hit[H_SCREENS], 16, ACCENT, hover == H_SCREENS ? 0.85f : 1);
-    powerIcon(x + w - 110, y + 17, 0xFFFFFF);
-    text(L"Screens off", F_BOLD, rc(x + w - 98, y + 7, 92, 18), 0xFFFFFF, 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+    powerIcon(x + w - 94, y + 17, 0xFFFFFF);
+    text(L"Screens off", F_BOLD, rc(x + w - 82, y + 7, 70, 18), 0xFFFFFF, 1, DWRITE_TEXT_ALIGNMENT_LEADING);
     y += 32 + GAP;
 
     if (hasRgb) {
