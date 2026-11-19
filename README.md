@@ -26,11 +26,11 @@ This works for a Blackout click and for Windows' own display timeout.
 <img src="docs/panel-gpu.png" width="280" alt="GPU tab: profile and XBAR offset">
 </p>
 
-- **Main:** Screens off, RGB, turn RGB off with the screens. With a fan curve: the temperature, fan speed, a 15 minute graph, RPM per fan, the curve on/off switch and the override. With GPU profiles: the profile on the card and what the driver answered.
-- **Settings > Fans:** the fan curve (drag a point, double-click to add one, right-click to remove one), max fan speed, how far the temperature must drop before fans slow down, reset.
-- **Settings > Wake:** Hotkey mode, and what woke the screens last, with the device behind it.
+- **Main:** Screens off, RGB lighting, RGB off with the screens. With a fan curve: the temperature, fan speed, a 15 minute graph, RPM per fan, the switch that makes the fans follow the temperature and the override at a fixed speed. With GPU profiles: the profile on the card, a dot that is green when the driver took it, and the XBAR offset.
+- **Settings > Fans:** the fan curve (drag a point, double-click to add one, right-click to remove one), max fan speed, how much cooler it must get before the fans slow down, reset.
+- **Settings > Wake:** which inputs may wake the screens, and what woke them last, with the device behind it.
 - **Settings > GPU:** overclock profiles for an NVIDIA card: the clock curve as a chart, power limit, memory offset, XBAR offset (see [GPU profiles](#gpu-profiles-optional)).
-- **Settings > System:** Start with Windows, Exit, and a status list of what Blackout found on this PC.
+- **Settings > System:** Start with Windows, Exit, and what Blackout found on this PC, with its version.
 
 Esc goes back or closes the panel, the arrow keys change tabs. If Direct2D is unavailable, a plain menu appears instead. Hover the tray icon for the temperature, the fan speed and the GPU profile.
 
@@ -66,9 +66,9 @@ One temperature drives up to 7 fans along a curve you draw in the panel. The usu
 3. Add `[fans]` to `blackout.ini` with `outputs=` and, unless you use the iCUE LINK coolant sensor, `source=`.
 4. Run Blackout as admin and tick **Start with Windows**. As admin this creates a logon task, so there is no UAC prompt at login.
 
-Edit the curve in the panel (Settings > Fans): drag a point, double-click the chart to add one, right-click a point to remove it, and set max fan speed and the slow-down margin. Changes apply at once and are kept in `HKCU\Software\Blackout` (`Curve`, `FanMax`, `Hysteresis`), which override the ini. **Reset to blackout.ini** drops them.
+Edit the curve in the panel (Settings > Fans): drag a point, double-click the chart to add one, right-click a point to remove it, and set **Max fan speed** and **Slow down once cooler by**. Changes apply at once and are kept in `HKCU\Software\Blackout` (`Curve`, `FanMax`, `Hysteresis`), which override the ini. **Reset to blackout.ini** drops them.
 
-**Override** (panel main view, or the tray menu) runs the fans at one fixed speed, 20 to 100%, instead of the curve. **Override speed** under it sets that speed, also before the override is switched on. It pauses while the temperature is above the point where the curve reaches its top, and comes back once it is 2 C below that.
+**Override at a fixed speed** (panel main view, or the tray menu) runs the fans at one fixed speed, 20 to 100%, instead of the curve. **Fixed speed** under it sets that speed, also before the override is switched on. It pauses while the temperature is above the point where the curve reaches its top, and comes back once it is 2 C below that.
 
 Fans go up straight away and come down after the hysteresis. Motherboard fans go back to the BIOS curve when the temperature reading is lost for 20 s, on exit, sleep and shutdown, and when the curve is switched off. Set a sensible fixed speed or curve in the BIOS: it is what runs whenever Blackout does not.
 
@@ -88,9 +88,9 @@ Untested means the file was written from other open source drivers and has not b
 
 An older `blackout.ini` with `channels=1,3,4` keeps working: it means `outputs=sio/2,sio/4,sio/5`.
 
-## Hotkey mode
+## Choosing what wakes the screens
 
-A bumped mouse or a vibrating desk can wake the screens in the middle of the night. With **Hotkey mode** on (panel > Settings > Wake), only the chosen inputs wake them while they are off:
+A bumped mouse or a vibrating desk can wake the screens in the middle of the night. With **Wake the screens only with** switched on (panel > Settings > Wake), only the chosen inputs wake them while they are off:
 
 - **Left-click** and/or **Esc** (at least one stays on)
 - Mouse movement, other buttons and other keys are ignored, and don't reach any app
@@ -98,7 +98,7 @@ A bumped mouse or a vibrating desk can wake the screens in the middle of the nig
 
 It applies whenever the screens go off, from Blackout or from Windows' own display timeout. Nothing runs for it while the screens are on.
 
-The same tab lists the last few wakes and the device behind each one (for example `Mouse: PRO X SUPERLIGHT`), with or without Hotkey mode. Use it to find a device that keeps waking the screens.
+The same tab lists the last few wakes and the device behind each one (for example a mouse icon and `PRO X SUPERLIGHT`), whether that switch is on or not. A device that got past it is marked `not blocked`. Use the list to find a device that keeps waking the screens.
 
 ## Configuration
 
@@ -144,8 +144,8 @@ On a PC with an NVIDIA driver the panel's Settings have a **GPU** tab:
 - **Profiles** along the top. Clicking one only shows it: its clock curve over the card's own curve (the grey line), the top of the curve with the lowest voltage that reaches it, the power limit in % and the memory offset in MHz. **Apply** sends it. Red marks the profile that is on the card.
 - **Read from card** keeps what the card is running now as the profile on show, so an overclock you have tuned and tested in any app becomes a Blackout profile with one click. **+** is the next empty profile. A profile that exists asks before it is replaced.
 - Click a profile's name to change it.
-- **XBAR offset**: the minus and plus under it step through the `xbar` values from `blackout.ini`. Sent a moment after the last step, and kept when you change profile.
-- The line at the bottom says what the driver answered. The Main view and the tray tooltip repeat it.
+- **XBAR offset**: its minus and plus step through the `xbar` values from `blackout.ini`. Sent a moment after the last step. It is a row of its own because it belongs to the card, not to a profile.
+- The line at the bottom says what the driver answered. On the Main view the dot beside the profile is green when it was applied, and the tray tooltip names the profile.
 
 Nothing is read from the card while the panel is open; **Read from card** reads it once.
 It uses private driver interfaces and is tested on one card (RTX 5090 FE, driver 621.24). Read [docs/gpu.md](docs/gpu.md) first: setup, limits, the layouts and their sources.
@@ -193,7 +193,7 @@ Things we hit running Blackout every day on a water-cooled desktop (ASRock Z790 
 | Two fan chains on one 1 A header | A chain of three 120 mm fans draws about 0.9 to 1.3 A at 100% | Cap `max=` (we run 80%) until the fans have a powered hub |
 | The legacy monitor-off broadcast | A monitor on the motherboard's iGPU came straight back; some iGPU DisplayPort outputs stayed half awake ("No Signal" flashes) | Blackout sets the display timeout to 1 s instead; list such monitors in `[ddc] monitors=` so they are powered off over DDC/CI. Best: run every monitor from the graphics card |
 | Kingston FURY RGB not seen by OpenRGB | RAM stays lit | Use the FURY module. Keep Kingston FURY CTRL installed: it is also what blanks the DIMM lighting on sleep |
-| A bumped mouse wakes the screens at night | | Hotkey mode |
+| A bumped mouse wakes the screens at night | | Settings > Wake: **Wake the screens only with** a left-click or Esc |
 | Run key and logon task both present | Whichever starts first holds the single-instance lock. If that is the non-admin Run-key copy, there is no fan control | Use one: as admin, **Start with Windows** makes the logon task |
 | A GPU driver reset | A clock cap set with `nvidia-smi -lgc` is gone | The `[gpu]` cap is re-sent every minute |
 
