@@ -15,7 +15,7 @@ One small exe. No installer, no driver, no admin rights, no service. It works wi
 
 This works for a Blackout click and for Windows' own display timeout.
 
-**Left-click** the icon: screens off.
+**Left-click** the icon: screens off. Clicked by mistake? Click again before the screens go dark and it is cancelled.
 **Right-click**: the Blackout panel. It sits flush against the taskbar and the screen edge like the system tray menus, and takes its colour from your taskbar.
 
 <p>
@@ -29,6 +29,7 @@ The panel is one view and shows only what is set up on your PC:
 - **Screens off.**
 - **RGB lighting** and **RGB off with the screens**, once lighting is set up. RGB set to off stays off: waking the screens only brings the lighting back if the RGB switch is on.
 - **Wake the screens only with** a left-click, Esc, or both, and under it what woke the screens last.
+- **Screens off when locked**: locking the PC (Win+L) turns the screens off. While it stays locked, a screen woken on the lock screen goes off again after 10 s without input.
 - **Start with Windows**, what Blackout found on this PC (green: working, amber: the line says what is wrong), the version and Exit.
 
 The third picture is a PC with no `blackout.ini`. Esc closes the panel. If Direct2D is unavailable, a plain menu appears instead.
@@ -77,6 +78,7 @@ Blackout runs with your normal rights. Windows keeps a normal program away from 
 
 | Where | Limit |
 |---|---|
+| Wake rules on the lock screen | The lock screen is Windows' secure desktop, which a program cannot watch, so any input wakes the screens there. With **Screens off when locked** they go back off after 10 s without input |
 | Wake rules and wake log | If a program running as administrator (an installer, an admin terminal, Task Manager) is in front when the screens go off, Windows does not show Blackout the input that goes to it. Expect that input to wake the screens, and the log to say `not blocked` or name no device |
 | Window restore | Windows of programs running as administrator may not be put back where they were |
 | OpenRGB | Blackout starts OpenRGB with its own rights. Devices that OpenRGB can only reach as administrator (RAM and some motherboards, over SMBus) will not change |

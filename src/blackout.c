@@ -8,6 +8,7 @@
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <powrprof.h>
+#include <wtsapi32.h>
 #include <physicalmonitorenumerationapi.h>
 #include <lowlevelmonitorconfigurationapi.h>
 
@@ -18,6 +19,7 @@
 #define ID_EXIT      5
 #define ID_SYNC      6
 #define ID_HOTKEY    7
+#define ID_LOCK      8
 #define TIMER_OFF    1
 #define TIMER_BUSY   2
 #define TIMER_LINK   3
@@ -52,7 +54,7 @@ static void panelUpdate(void);
 // The switches, read from HKCU\Software\Blackout once at startup and written through when changed, so neither the
 // 4 s tick nor a display event nor the panel reads the registry. litWant is what the user wants while the screens are
 // on (the RGB switch), litOn the lighting right now, which also goes off with the screens when syncOn is set.
-static BOOL litOn = TRUE, litWant = TRUE, syncOn = TRUE, hotkeyOn, wakeClick = TRUE, wakeEsc = TRUE;
+static BOOL litOn = TRUE, litWant = TRUE, syncOn = TRUE, hotkeyOn, wakeClick = TRUE, wakeEsc = TRUE, lockOff;
 static BOOL linkOk; // the iCUE LINK hub took the last frame
 // What woke the screens. Kept in memory only, newest first. icon: 'M' mouse, 'K' keyboard, 0 neither. slip: the input
 // got past the wake rules.
@@ -274,6 +276,29 @@ static void setIdleTimeout(DWORD seconds) {
     LocalFree(scheme);
 }
 
+// "Screens off when locked" (HKCU LockOff): locking turns the screens off, and while the PC stays locked Windows' own
+// lock screen timeout is cut to LOCK_SECONDS, so a screen woken on the lock screen goes back off by itself unless
+// someone is using it. The wake rules can't apply there: the lock screen is Windows' secure desktop, which a program
+// without admin rights can't watch. The timeout is put back on unlock.
+#define LOCK_SECONDS 10
+static const GUID lockTimeoutId = {0x8ec4b3a5, 0x6868, 0x48c2, {0xbe, 0x75, 0x4f, 0x30, 0x44, 0xbe, 0x88, 0xa7}}; // VIDEOCONLOCK
+static DWORD lockRestore = (DWORD)-1;
+static BOOL lockOnBattery;
+
+static void lockTimeout(BOOL shorten) {
+    GUID *scheme;
+    if ((lockRestore != (DWORD)-1) == shorten || PowerGetActiveScheme(NULL, &scheme) != ERROR_SUCCESS) return;
+    SYSTEM_POWER_STATUS power;
+    if (shorten) lockOnBattery = GetSystemPowerStatus(&power) && power.ACLineStatus == 0;
+    if (shorten && (lockOnBattery ? PowerReadDCValueIndex : PowerReadACValueIndex)(NULL, scheme, &GUID_VIDEO_SUBGROUP, &lockTimeoutId, &lockRestore) != ERROR_SUCCESS) lockRestore = (DWORD)-1;
+    else if (shorten || lockRestore != (DWORD)-1) {
+        (lockOnBattery ? PowerWriteDCValueIndex : PowerWriteACValueIndex)(NULL, scheme, &GUID_VIDEO_SUBGROUP, &lockTimeoutId, shorten ? LOCK_SECONDS : lockRestore);
+        PowerSetActiveScheme(NULL, scheme);
+        if (!shorten) lockRestore = (DWORD)-1;
+    }
+    LocalFree(scheme);
+}
+
 static void screensOff(HWND hwnd) {
     GUID *scheme;
     DWORD current;
@@ -289,6 +314,25 @@ static void screensOff(HWND hwnd) {
         LocalFree(scheme);
     }
     SetTimer(hwnd, TIMER_IDLE, 6000, NULL);
+}
+
+// A screens-off click can be taken back: a second click (or a double-click) before the screens have gone off
+// cancels it and puts everything back, instead of blacking out and then having to wake the screens again.
+static BOOL offArmed, offStarted;
+static void restoreIdle(void);
+
+static void offRequest(HWND hwnd) {
+    if (!offArmed) {
+        offArmed = TRUE, offStarted = FALSE;
+        // Short delay so the click release doesn't wake the screens straight back up.
+        SetTimer(hwnd, TIMER_OFF, 400, NULL);
+        return;
+    }
+    KillTimer(hwnd, TIMER_OFF);
+    KillTimer(hwnd, TIMER_IDLE);
+    restoreIdle();
+    if (offStarted) ddcPower(TRUE);
+    offArmed = offStarted = FALSE;
 }
 
 static void restoreIdle(void) {
@@ -373,6 +417,7 @@ static void showMenu(HWND hwnd) {
     AppendMenuW(menu, MF_STRING | (hotkeyOn ? MF_CHECKED : 0), ID_HOTKEY,
                 wakeClick && wakeEsc ? L"Wake the screens only with a left-click or Esc" : wakeClick ? L"Wake the screens only with a left-click" : L"Wake the screens only with Esc");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING | (lockOff ? MF_CHECKED : 0), ID_LOCK, L"Screens off when locked");
     AppendMenuW(menu, MF_STRING | (startupEnabled() ? MF_CHECKED : 0), ID_STARTUP, L"Start with Windows");
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"Exit");
     POINT pt;
@@ -483,8 +528,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(lp)) {
         case NIN_SELECT:
         case NIN_KEYSELECT:
-            // Short delay so the click release doesn't wake the screens straight back up.
-            SetTimer(hwnd, TIMER_OFF, 400, NULL);
+        case WM_LBUTTONDBLCLK:
+            offRequest(hwnd);
             return 0;
         case WM_CONTEXTMENU:
             if (!panelShow(hwnd)) showMenu(hwnd);
@@ -508,9 +553,11 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             restoreTopology();
             restoreWindows();
         } else if (wp == TIMER_OFF) {
+            offStarted = TRUE;
             screensOff(hwnd);
         } else if (wp == TIMER_IDLE) {
             // Idle path didn't take (e.g. something is holding the display on): fall back to the legacy message.
+            offArmed = FALSE;
             restoreIdle();
             if (screensOn) DefWindowProcW(hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
         } else {
@@ -524,10 +571,11 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case ID_SCREENS: SetTimer(hwnd, TIMER_OFF, 400, NULL); return 0;
+        case ID_SCREENS: offRequest(hwnd); return 0;
         case ID_RGB: rgbToggle(hwnd); return 0;
         case ID_SYNC: setDword(L"Sync", syncOn = !syncOn); return 0;
         case ID_HOTKEY: setDword(L"HotkeyMode", hotkeyOn = !hotkeyOn); return 0;
+        case ID_LOCK: setDword(L"LockOff", lockOff = !lockOff); return 0;
         case ID_STARTUP: toggleStartup(); return 0;
         case ID_EXIT: DestroyWindow(hwnd); return 0;
         }
@@ -540,6 +588,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 DWORD state = *(DWORD *)ps->Data;
                 if (state != 2) {
                     if (state == 0) {
+                        offArmed = FALSE;
                         KillTimer(hwnd, TIMER_IDLE);
                         restoreIdle();
                     }
@@ -563,6 +612,14 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
         return TRUE;
+    case WM_WTSSESSION_CHANGE:
+        if (wp == WTS_SESSION_LOCK && lockOff) {
+            lockTimeout(TRUE);
+            SetTimer(hwnd, TIMER_OFF, 400, NULL);
+        } else if (wp == WTS_SESSION_UNLOCK) {
+            lockTimeout(FALSE);
+        }
+        return 0;
     case WM_DISPLAYCHANGE:
         // Monitors re-enumerate a few seconds after waking; restore once they have settled.
         if (screensOn && savedCount) SetTimer(hwnd, TIMER_LAYOUT, 2500, NULL);
@@ -581,6 +638,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         hotkeyDisarm();
         restoreIdle();
+        lockTimeout(FALSE);
+        WTSUnRegisterSessionNotification(hwnd);
         if (link != INVALID_HANDLE_VALUE) {
             static const BYTE hardMode[] = {0x01, 0x03, 0x00, 0x01};
             linkCmd(hardMode, sizeof(hardMode), NULL, 0);
@@ -637,6 +696,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     hasRam = GetFileAttributesW(fury) != INVALID_FILE_ATTRIBUTES;
     litOn = getDword(L"RgbOn", 1), litWant = getDword(L"RgbWant", 1), syncOn = getDword(L"Sync", 1);
     hotkeyOn = getDword(L"HotkeyMode", 0), wakeClick = getDword(L"WakeClick", 1), wakeEsc = getDword(L"WakeEsc", 1);
+    lockOff = getDword(L"LockOff", 0);
+    WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
     // Blackout needs no admin rights, but may be started with them. An elevated window drops messages from normal
     // processes unless allowed (tray clicks and remote "screens off").
     ChangeWindowMessageFilterEx(hwnd, WM_COMMAND, MSGFLT_ALLOW, NULL);

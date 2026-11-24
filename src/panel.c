@@ -40,7 +40,7 @@
 #define GOOD        0x3FB950
 #define WM_RENDER   (WM_APP + 3)
 
-enum { H_NONE, H_SCREENS, H_RGB, H_SYNC, H_HOTKEY, H_WAKE_CLICK, H_WAKE_ESC, H_START, H_EXIT, H_COUNT };
+enum { H_NONE, H_SCREENS, H_RGB, H_SYNC, H_HOTKEY, H_WAKE_CLICK, H_WAKE_ESC, H_LOCK, H_START, H_EXIT, H_COUNT };
 enum { F_BRAND, F_ROW, F_SMALL, F_BOLD, F_TINY, F_COUNT };
 
 static const GUID IID_D2DFactory = {0x06152247, 0x6f50, 0x465a, {0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07}};
@@ -262,7 +262,7 @@ static float partsHeight(void) {
     return h ? h + 4 : 0;
 }
 static float panelHeight(void) {
-    return PAD + 32 + GAP + (hasRgb ? 2 * ROW + GAP : 0) + 2 * ROW + logHeight() + GAP + ROW + 10 + partsHeight() + 28 + PAD - 4;
+    return PAD + 32 + GAP + (hasRgb ? 2 * ROW + GAP : 0) + 2 * ROW + logHeight() + GAP + 2 * ROW + 10 + partsHeight() + 28 + PAD - 4;
 }
 
 // ---- The view ----
@@ -374,9 +374,11 @@ static void paintPanel(void) {
     }
     y += 2 * ROW + lh + GAP;
 
-    card(x, y, w, ROW);
-    toggleRow(L"Start with Windows", x, y, w, H_START, startOn);
-    y += ROW + 10;
+    card(x, y, w, 2 * ROW);
+    toggleRow(L"Screens off when locked", x, y, w, H_LOCK, lockOff);
+    divider(x, y + ROW, w);
+    toggleRow(L"Start with Windows", x, y + ROW, w, H_START, startOn);
+    y += 2 * ROW + 10;
 
     // The foot of the panel is about Blackout itself: what it drives on this PC, its version, and the way out.
     partsGrid(x + 2, y, w - 4, TRUE);
@@ -519,7 +521,7 @@ static void panelClick(int id) {
     case H_NONE: return;
     case H_SCREENS:
         DestroyWindow(panel);
-        if (!panelTest) SetTimer(panelOwner, TIMER_OFF, 400, NULL);
+        if (!panelTest) offRequest(panelOwner);
         return;
     case H_EXIT:
         DestroyWindow(panel);
@@ -530,6 +532,7 @@ static void panelClick(int id) {
         else rgbToggle(panelOwner);
         break;
     case H_SYNC: flip(&syncOn, L"Sync"); break;
+    case H_LOCK: flip(&lockOff, L"LockOff"); break;
     case H_HOTKEY: flip(&hotkeyOn, L"HotkeyMode"); break;
     // Keep at least one wake input, so the screens can always be woken.
     case H_WAKE_CLICK: if (!wakeClick || wakeEsc) flip(&wakeClick, L"WakeClick"); break;
@@ -786,7 +789,7 @@ static int panelDev(LPWSTR cmd) {
     if (all || flag(cmd, L"ddc")) lstrcpyW(ddcIds, L"BNQ7F2F");
     if (flag(cmd, L"longddc")) lstrcpyW(ddcIds, L"BNQ7F2F,DELA0EC,GSM5B7F,AUS27B1,SAM7106,ACR0B0C");
     hasRgb = hasOpenRgb || hasRam || linkLeds;
-    litWant = !flag(cmd, L"rgboff"), syncOn = !flag(cmd, L"nosync"), startOn = !flag(cmd, L"nostart");
+    litWant = !flag(cmd, L"rgboff"), syncOn = !flag(cmd, L"nosync"), startOn = !flag(cmd, L"nostart"), lockOff = flag(cmd, L"lockoff");
     hotkeyOn = flag(cmd, L"hotkey"), wakeClick = !flag(cmd, L"noclick"), wakeEsc = !flag(cmd, L"noesc");
     wakeCount = longWakes ? MAX_WAKES : (at = wcsstr(cmd, L"wakes=")) ? _wtoi(at + 6) : 0;
     if (wakeCount > MAX_WAKES) wakeCount = MAX_WAKES;
